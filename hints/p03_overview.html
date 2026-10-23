@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P03 提示 · Orchestrator v2：async_chunk 预热 + 终态守门</title>
+<meta name="description" content="开启 async_chunk 后 stage 之间走 connector 直传，orchestrator 不再转发数据；但控制面和数据面是两条路，完成信号可能乱序——音频 stage 先说“我完了”，talker 还没报告完成。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p02_overview.html">← <span class="lbl">P02</span></a><a href="p01_overview.html"><span class="lbl">P01</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#10 · Track A · 前端与 Orchestrator · 书 p.51</div>
+<h1>P03 · Orchestrator v2：async_chunk 预热 + 终态守门</h1>
+<p class="lede">开启 async_chunk 后 stage 之间走 connector 直传，orchestrator 不再转发数据；但控制面和数据面是两条路，完成信号可能乱序——音频 stage 先说“我完了”，talker 还没报告完成。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p03_async_chunk_orchestrator.py</code></span>
+<span class="badge">验收 <code>./check.sh p03</code></span>
+<span class="badge">提示 <b>A-10</b> · 参考解 <b>C-10</b> <code>solutions/p03_async_chunk_orchestrator.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P03">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · 只有两处变了</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 1（talker 的完成报告迟到）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：thinker 每 decode 一个 token 就把向量经 connector 发给 talker，talker 每攒够一个窗口就把 codec 发给 code2wav——数据不经过 orchestrator。orchestrator 只剩两件事：<strong>请求到达时预热下游 stage</strong>（提交占位请求，让它在 scheduler 里等第一个 chunk），以及<strong>守门终态</strong>。</li>
+<li><strong>为什么预热</strong>：等 thinker 产出第一个 chunk 才提交 talker，就多一次 “stage→orchestrator→stage” 往返；预热后第一个 chunk 一落地 talker 就能开始。</li>
+<li><strong>为什么守门</strong>：</li>
+</ul>
+<pre><code>时间 →
+stage2 (audio, final):  ... wav5(fin)           ← 控制面上先到
+stage1 (talker):        ............... (fin)   ← 晚到（它的 IPC 慢了一拍）
+如果在 wav5(fin) 时就发 finished 并清理：
+ - 清理会回收 stage1 仍在使用的资源（SHM、绑定）
+ - stage1 的完成消息成了“未知请求”的输出
+</code></pre>
+<ul>
+<li><strong>规则</strong>：最后一个 final stage 完成、但 <code>submitted ⊄ finished</code> 时，把终态消息存进 <code>pending_final</code>；等最后一个已提交 stage 也完成时再发出。仍然要求恰好一条终态且为最后一条。</li>
+<li><strong>需求清单</strong>：add：注册状态 → 把 0..last 都标记为 submitted → 先提交 stage 0（真实 prompt），再提交下游（<code>prewarm_fn(sid, prompt)</code> 占位）· 不做任何转发 · 清理后到达的输出丢弃计数，状态不复活。本题直接继承你的 P02，覆盖 <code>_handle_add</code> 和 <code>_handle_output</code>。</li>
+</ul>
+<p><strong>验收要点</strong>：每个 stage 只被提交一次、下游拿到 prewarm 占位输入 · 非 final 的 stage1 迟 200ms 才报告完成时终态必须等它 · 20 个请求 + 迟到完成：每个请求恰好一个终态且是最后一条 · 清理后到达的输出被丢弃、状态不复活。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">车间主任和传送带</div><p>P02：每道工序做完一整批零件交给车间主任，主任搬到下一道工序。P03：工序之间装了传送带（connector），上一道每做好一个零件就直接放上去——流水线并行起来。车间主任不再搬零件，只剩两件事：① 开工时通知所有工序“有新订单，准备接传送带”（prewarm）；② 收工时确认<strong>每一道工序都停机了</strong>，才给客户签收单（终态守门）。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">快递和签收短信</div><p>货物走物流（数据面），“已发货/已完成”走短信（控制面）。最后一站的签收短信可能比中转站的“已出库”短信先到。你一看到“已签收”就把订单归档删除，几秒后中转站的短信到了你却找不到这张订单；更糟的是归档时你可能已经把中转站还在用的托盘（共享内存、绑定）收回了。</p>
+</div>
+<h2 id="s3">框架视角 · 只有两处变了</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>和 P02 相比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>不变：同一个事件循环里的 task。新增的 connector 是 stage 进程之间的边界，orchestrator 不碰它</td>
+</tr>
+<tr>
+<td>S</td>
+<td>ReqState 多用一个字段 <code>pending_final</code>；<code>submitted</code> 的含义变成“预热过的所有 stage”；<code>stage_data</code> 不再需要</td>
+</tr>
+<tr>
+<td>B / W / C</td>
+<td>完全不变：reader × N、request_handler、dispatcher、三个队列——所以 P03 能直接继承 P02</td>
+</tr>
+<tr>
+<td>L / I</td>
+<td>不变</td>
+</tr>
+<tr>
+<td><strong>F</strong></td>
+<td>变了：add 时一次性标记 submitted；终态条件多了 <code>submitted ⊆ finished</code>；<strong>非 final stage 的完成事件也可能触发发送</strong>（放行 pending_final）</td>
+</tr>
+<tr>
+<td><strong>E</strong></td>
+<td>清理后再到的输出照样丢弃计数，绝不能因为 S1 的迟到完成消息而重新建出状态</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>沿用 P02 只标 <code>{0}</code>：S2 最后一块到达时 <code>{0} ⊆ {0,2}</code> 成立，终态提前发出并清理；S1 迟到的完成报告变成 dropped。</li>
+<li>非 final stage 完成时不检查 pending_final：用户永远收不到终态，next_output 超时，request_states 泄漏。</li>
+<li>存进 pending_final 的同时也发了出去，或发 pending 后忘记清理：终态重复或状态泄漏。</li>
+<li>直接沿用 P02 的 <code>_handle_output</code>：S0 完成时会调用 forward_fn 并 submit S1——S1 被 submit 两次，第二次输入是 None。</li>
+<li>未知 id 时复活状态（setdefault）：新 ReqState 的 submitted 为空，门形同虚设，迟到输出被发给用户、出现在终态之后，状态永久泄漏。</li>
+</ul>
+<h2 id="s5">逐步图：例 1（talker 的完成报告迟到）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ final={0,2}，prewarm_fn = lambda sid, p: f&quot;warm{sid}:{len(p)}&quot;，add_request(&quot;r1&quot;, &quot;hi there&quot;)</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. add：一次性标记、依次 submit</div><p>注册 → <code>submitted = {0,1,2}</code>（<strong>在第一次 await 之前</strong>）→ <code>S0.submit(&quot;r1&quot;, &quot;hi there&quot;)</code> → <code>S1.submit(&quot;r1&quot;, &quot;warm1:8&quot;)</code> → <code>S2.submit(&quot;r1&quot;, &quot;warm2:8&quot;)</code>。每个 stage 只 submit 一次。</p>
+</div><div class="step" data-hl=""><div class="step-title">2. S0 (&quot;hi&quot;, False)</div><p>finished = {}；all_final = F；all_done = F → 发 <code>(0,'hi',F)</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">3. S0 (&quot;there&quot;, True)</div><p>finished = {0}；all_final = F → 发 <code>(0,'there',F)</code>。<strong>不转发</strong>。</p>
+</div><div class="step" data-hl=""><div class="step-title">4. S2 (&quot;wav:HI&quot;, False)</div><p>finished = {0} → 发 <code>(2,'wav:HI',F)</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">5. S2 (&quot;wav:THERE&quot;, True)：扣下终态</div><p>finished = {0,2}；all_final = <strong>T</strong>；all_done = <code>{0,1,2} ⊆ {0,2}</code> = <strong>F</strong></p>
+<p>→ 构造 <code>(2,'wav:THERE',T)</code> 存进 <code>pending_final</code>，<strong>什么都不发</strong>，return。</p>
+</div><div class="step" data-hl=""><div class="step-title">6. S1 (None, True)：最后一块拼图</div><p>finished = {0,1,2}；S1 不是 final，但 all_done 成立且 pending 不为空 → 发出 <code>(2,'wav:THERE',T)</code>，清理。</p>
+</div><div class="step" data-hl=""><div class="step-title">7. S2 (&quot;wav:EXTRA&quot;, False)</div><p>状态已清理 → <code>dropped_outputs == 1</code>，不复活。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>例 1 见上方逐步图。</p>
+<p><strong>例 2：正常顺序</strong>（S1 在 S2 之前完成）：S0 hi → <code>(0,'hi',F)</code>；S0 there(T) → <code>(0,'there',F)</code>；S1 tok(T) → 无；S2 wav:HI → <code>(2,'wav:HI',F)</code>；S2 wav:THERE(T) → <code>(2,'wav:THERE',T)</code>，随即清理。不需要 pending_final：最后一个 final stage 完成的那一刻所有已提交的 stage 也都完成了。</p>
+<p><strong>例 3：最后完成的 final stage 是 S0</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>到达</th>
+<th>用户收到</th>
+<th>finished</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S0 (&quot;hi&quot;, False)</td>
+<td>(0,'hi',False)</td>
+<td>{}</td>
+</tr>
+<tr>
+<td>S2 (&quot;wav:HI&quot;, True)</td>
+<td>(2,'wav:HI',False)</td>
+<td>{2}</td>
+</tr>
+<tr>
+<td>S1 (None, True)</td>
+<td>（无）</td>
+<td>{1,2}</td>
+</tr>
+<tr>
+<td>S0 (&quot;there&quot;, True)</td>
+<td>(0,'there',True)，清理</td>
+<td>—</td>
+</tr>
+</tbody>
+</table></div>
+<p>终态消息的 stage_id 不一定是 last_stage——它是“让条件第一次成立的那条输出”所在的 stage。</p>
+<h4>关键问题</h4>
+<ol>
+<li>P02 里 submitted 是随转发一点点增长的；P03 里 add 时就要包含 0..last。沿用 P02 只标 {0}，例 1 在哪一步出错、错成什么样？在第一次 await 之前标完有什么好处？</li>
+<li>例 1 第 4 行：最后一个 final stage 完成但 S1 还没完成。用户应该收到什么？要存什么、存在哪？</li>
+<li>非 final stage 报告完成时 handler 要做什么？什么条件下什么都不用做？</li>
+<li>“所有 final stage 都完成”和“所有已提交的 stage 都完成”分别写出来。各自控制什么？</li>
+<li>非 final stage 的 data 会出现在用户侧吗？stage_data 在本题还有用吗？</li>
+<li>继承 P02 时哪些可以原封不动复用？</li>
+<li>pending_final 已存好之后，又来一条非 finished 的 S1 输出，怎么处理？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>构造函数里 <code>forward_fn=lambda *_: None</code> 只是为了满足父类签名。</li>
+<li>提交顺序：先 S0（真实 prompt），再 S1、S2……（占位），范围 <code>0..last_stage</code>。</li>
+<li>两道门：OrchOutput.finished 的取值仍是 P02 的“所有 final stage 都完成”；但 finished=True 的消息<strong>何时发出</strong>多了一个条件 <code>submitted ⊆ finished</code>。</li>
+<li><code>pending_final</code> 存的是已构造好的 finished=True 的 OrchOutput，之后原样发出。</li>
+<li>如果你的 P02 把这两步写死在 dispatcher 里而不是独立方法，先回去重构 P02。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>add 路径</strong>：建 ReqState → 注册 → <code>submitted = {0..last}</code>（全部同步）→ <code>await S0.submit(prompt)</code> → 依次 <code>await S_k.submit(prewarm_fn(k, prompt))</code>。</li>
+<li><strong>输出路径决策表</strong>（先查状态、未知就 drop；若 finished 就加入 st.finished）：</li>
+</ul>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>这条输出来自</th>
+<th>all_final（final ⊆ finished）</th>
+<th>all_done（submitted ⊆ finished）</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>final stage</td>
+<td>否</td>
+<td>—</td>
+<td>发 <code>OrchOutput(..., finished=False)</code></td>
+</tr>
+<tr>
+<td>final stage</td>
+<td>是</td>
+<td>是</td>
+<td>发 finished=True 的消息，清理</td>
+</tr>
+<tr>
+<td>final stage</td>
+<td>是</td>
+<td>否</td>
+<td>构造 finished=True 的消息，存进 pending_final，不发</td>
+</tr>
+<tr>
+<td>非 final stage</td>
+<td>—</td>
+<td>是，且有 pending_final</td>
+<td>发 pending_final，清理</td>
+</tr>
+<tr>
+<td>非 final stage</td>
+<td>—</td>
+<td>其他</td>
+<td>什么都不做</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><code>submitted</code> 是守门的依据：少一个 stage，门就少一道。在第一次 await 之前一次性标完，和 P02“先注册再 submit”是同一个原则。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>只标 {0} 时，S2 的 &quot;wav:THERE&quot; 到达那一刻 finished={0,2}，<code>{0} ⊆ {0,2}</code> 成立，终态立即发出并清理——正是本题要防止的“提前终态”；随后 S1 的完成报告变成未知 id，<code>dropped_outputs == 1</code>。在第一次 await 前标完，则无论哪个 await 点插进来的输出，看到的都是完整的 submitted。</li>
+<li>什么都不发。构造 finished=True 的 OrchOutput，存进 <code>st.pending_final</code>，直接 return。</li>
+<li>把 sid 加进 finished 后检查 <code>submitted ⊆ finished</code> 且 <code>pending_final is not None</code>：都成立就发出 pending 并清理。pending 为空（还有 final stage 没完成，例 2 的 S1）时什么都不做。</li>
+<li><code>all_final = final_stage_ids ⊆ finished</code>：决定 OrchOutput.finished 的值。<code>all_done = submitted ⊆ finished</code>：决定 finished=True 的消息立即发出（并清理）还是先扣在 pending_final。</li>
+<li>不会；非 final stage 的输出只用来更新 finished。stage_data 不需要。</li>
+<li>start / shutdown / add_request / next_output / reader / dispatcher / request handler / <code>_cleanup</code> 全部复用；只换 <code>_handle_add</code> 和 <code>_handle_output</code>。</li>
+<li>它不是 finished，不改变任何集合，落入“什么都不做”。</li>
+</ol>
+</div></details>
+<p><strong>例 1 状态演化</strong>（✓ = finished=True）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事件</th>
+<th>submitted</th>
+<th>finished</th>
+<th>all_final</th>
+<th>all_done</th>
+<th>pending</th>
+<th>发给用户</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>add</td>
+<td>{0,1,2}</td>
+<td>{}</td>
+<td></td>
+<td></td>
+<td>None</td>
+<td></td>
+</tr>
+<tr>
+<td>S0 hi</td>
+<td>{0,1,2}</td>
+<td>{}</td>
+<td>F</td>
+<td>F</td>
+<td>None</td>
+<td>(0,hi,F)</td>
+</tr>
+<tr>
+<td>S0 there ✓</td>
+<td>{0,1,2}</td>
+<td>{0}</td>
+<td>F</td>
+<td>F</td>
+<td>None</td>
+<td>(0,there,F)</td>
+</tr>
+<tr>
+<td>S2 wav:HI</td>
+<td>{0,1,2}</td>
+<td>{0}</td>
+<td>F</td>
+<td>F</td>
+<td>None</td>
+<td>(2,wav:HI,F)</td>
+</tr>
+<tr>
+<td>S2 wav:THERE ✓</td>
+<td>{0,1,2}</td>
+<td>{0,2}</td>
+<td>T</td>
+<td>F</td>
+<td>(2,wav:THERE,T)</td>
+<td>—</td>
+</tr>
+<tr>
+<td>S1 ✓</td>
+<td>{0,1,2}</td>
+<td>{0,1,2}</td>
+<td>T</td>
+<td>T</td>
+<td>→ 发出</td>
+<td>(2,wav:THERE,T)，清理</td>
+</tr>
+<tr>
+<td>S2 wav:EXTRA</td>
+<td>—</td>
+<td>—</td>
+<td></td>
+<td></td>
+<td></td>
+<td>dropped += 1</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>骨架注意</strong>：<code>_cleanup</code> 在 <code>await self._out_q.put</code> 之后——无界队列的 put 不会真正挂起，即使挂起，状态也已一致（pending 已取出）。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>为什么过早发终态会导致资源问题？（提示：清理会回收上游仍在写的 SHM）</li>
+<li>如果 prewarm 的占位 prompt 长度依赖上游结果怎么办？</li>
+</ul>
+<p>对照源码：<code>engine/orchestrator.py:1954-1967</code> · <code>:2036-2040</code> · <code>:2711-2870</code></p>
+<nav class="pager"><a class="prev" href="p02_overview.html"><small>← 上一题</small>#9 · P02 Orchestrator v1：线性多 stage 路由</a><a class="next" href="p01_overview.html"><small>下一题 →</small>#11 · P01 OutputSink：线程 → asyncio 的批量唤醒</a></nav>
+</main>
+</body>
+</html>

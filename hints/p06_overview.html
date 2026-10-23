@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P06 提示 · BlockManager：paged KV + 前缀缓存</title>
+<meta name="description" content="PagedAttention 的内存管理层：引用计数、哈希链前缀匹配、LRU 可驱逐池、原子分配。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p07_overview.html">← <span class="lbl">P07</span></a><a href="p08_overview.html"><span class="lbl">P08</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#17 · Track B · Stage 进程与调度 · 书 p.76</div>
+<h1>P06 · BlockManager：paged KV + 前缀缓存</h1>
+<p class="lede">PagedAttention 的内存管理层：引用计数、哈希链前缀匹配、LRU 可驱逐池、原子分配。</p>
+<div class="badges">
+<span class="badge">⏱ <b>75 min</b></span>
+<span class="badge diff-难">难度 <b>难</b></span>
+<span class="badge">实现 <code>mine/p06_block_manager.py</code></span>
+<span class="badge">验收 <code>./check.sh p06</code></span>
+<span class="badge">提示 <b>A-17</b> · 参考解 <b>C-17</b> <code>solutions/p06_block_manager.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P06">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · 三个操作 · 一张账本 · 不变量</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：前缀共享 + 引用计数 + 可驱逐池（例 2）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：KV cache 被切成固定大小的物理 block（例如 16 个 token）。每个序列有一张 block table：逻辑块 i → 物理块号。attention kernel 用 <code>slot = table[pos // bs] * bs + pos % bs</code> 找到 token 的 K/V。</li>
+<li><strong>前缀缓存</strong>：同一个 system prompt、同一张图的多轮对话，前缀 KV 完全相同。满的 block 用哈希链标识：<code>h_i = hash((h_{i-1}, tuple(block_i 的 token)))</code>（链式哈希保证“相同内容但前缀不同”的块不会误命中）。分配时从头逐块匹配，命中就共享物理块（引用计数 +1）。</li>
+</ul>
+<pre><code>prompt: [0..9]（bs=4） → 块 [0,1,2,3] [4,5,6,7] [8,9,_,_]
+可匹配块数 = (len - 1) // bs = 2    # 至少留 1 个 token 要算（否则拿不到下一个 token 的 logits）
+num_cached_tokens = 命中块数 × bs
+</code></pre>
+<ul>
+<li><strong>释放与驱逐</strong>：free 时逆序减引用；归零的块：有哈希 → 进 LRU 可驱逐池（仍能被命中复用）；无哈希 → 回空闲表。需要新块时优先空闲表，其次驱逐 LRU 最旧的（同时删除它的哈希登记）。<code>num_free_blocks = 空闲 + 可驱逐</code>。</li>
+<li><strong>原子性</strong>：allocate / append 因 block 不足失败时必须<strong>不改变任何状态</strong>（先检查后修改）。命中可驱逐池里的块也会占用“可用”名额。</li>
+<li><strong>append 填满一个块</strong>：decode 让最后一个块变满时也要计算哈希并登记，后续请求可以命中模型生成的内容（多轮对话）。</li>
+</ul>
+<p><strong>验收要点</strong>：slot 映射 · append 跨 block 边界 · OutOfBlocks 原子性 · free 全部归还 · 前缀共享与引用计数 · free 后缓存仍可命中、最后一个 token 永不命中 · 驱逐后不再命中 · append 填满的 block 也进入缓存。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">酒店客房与房卡清单</div><p>物理 block = 一间四人间（block_size=4 张床），num_blocks = 酒店一共几间房。一个序列 = 一个旅行团，前台给它一张房卡清单（block table）：第 1 批住 2 号房、第 2 批住 7 号房……房间号不需要连号——这正是 paged 的意义。<code>slot(seq, pos)</code> 就是“第 pos 号客人睡哪张床”：房号 × 每间床数 + 床位号。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">图书馆的“还书推车”（evictable LRU 池）</div><p>读者还书后，书先放在还书推车上：① 别的读者正好要这本书，可以直接从推车上拿走（命中一个 ref==0 的块，“复活”它）；② 推车满了，馆员从最早放上来的那一端拿走一本，抹掉内容改装成别的书（LRU 驱逐）。抹掉的那一刻必须把目录卡片（hash → block）也撕掉，否则下一个读者按目录拿到封面对、内容全错的书——KV 错乱，模型不报错，只会悄悄说胡话。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">哈希链 = 快递面单上的“全程路径”</div><p>如果块的标签只写“本块装了 [7, 8]”，两个前缀完全不同的序列会误认为能共享它。可 KV 的值依赖从句首到这里的全部上下文。所以标签写成“上一块的标签 + 本块内容”，只有整条前缀都一样的序列才会算出同一个 h_i。</p>
+</div>
+<h2 id="s3">框架视角 · 三个操作 · 一张账本 · 不变量</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>操作</th>
+<th>读（只读，不能有副作用）</th>
+<th>写（顺序很重要）</th>
+<th>可能 raise 的位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>allocate</td>
+<td>① 满块的哈希链（只给 len//bs 个满块算）② 在前 (len-1)//bs 块内从头连续查 hash→block，第一次 miss 就停 ③ 容量：需要新块数 ≤ num_free_blocks − 命中块中 ref==0 的个数</td>
+<td>④ 命中块：ref==0 的先移出可驱逐池 → ref+1 ⑤ 其余块：取新块（空闲优先，否则驱逐最旧 + 删哈希登记）⑥ 满块登记哈希 ⑦ 保存 table / tokens / 哈希链 / 命中数</td>
+<td>只在 ③（以及 ⑤ 的兜底）；必须在任何写之前</td>
+</tr>
+<tr>
+<td>append_slot</td>
+<td><code>pos = len(tokens[seq])</code>；<code>pos // bs == len(table)</code> 吗（要不要新块）</td>
+<td>① 先取新块（唯一会 raise 的事）② 再 append token ③ 若 <code>(pos+1) % bs == 0</code>：这块刚满 → 用链尾当父哈希，算新哈希、入链、登记</td>
+<td>只在 ①；顺序反了会留下“多了一个 token”的脏状态</td>
+</tr>
+<tr>
+<td>free</td>
+<td>该序列的 block table</td>
+<td>逆序遍历：ref−1；归零时有哈希 → 进可驱逐池（最新一端），否则 → 空闲表；最后删掉该序列的四份记录</td>
+<td>不会 raise</td>
+</tr>
+</tbody>
+</table></div>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>不变量</th>
+<th>违反时的症状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>I1 <code>num_free_blocks == len(空闲表) + len(可驱逐池)</code>，二者不相交，块都满足 ref == 0</td>
+<td>同一个块被分配给两个序列，内容互相覆盖</td>
+</tr>
+<tr>
+<td>I2 <code>b ∈ 可驱逐池 ⟺ ref[b] == 0 且 block_hash[b] is not None</code></td>
+<td>命中后忘了移出池子 → 正在用的块被当候补驱逐</td>
+</tr>
+<tr>
+<td>I3 <code>hash_to_block[h] == b ⟹ block_hash[b] == h</code></td>
+<td>驱逐后没删映射 → 旧前缀“命中”一块已被覆盖的块</td>
+</tr>
+<tr>
+<td>I4 <code>ref[b] ==</code> 包含 b 的 block table 个数；全部 free 后 num_free_blocks == num_blocks</td>
+<td>block 泄漏：跑一会儿就 OutOfBlocks</td>
+</tr>
+<tr>
+<td>I5 <code>num_cached_tokens(seq) % bs == 0</code> 且 <code>&lt; len(token_ids)</code></td>
+<td>全部命中时模型没有 token 可 forward，采不出下一个 token</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>给半满的最后一块也算哈希：之后更长的 prompt 会命中只装了部分 token 的块。只有满块才有身份。</li>
+<li>可匹配上限写成 <code>len // bs</code>：prompt 恰为 bs 整数倍且全命中时 num_cached_tokens == len，违反 I5。</li>
+<li>哈希链起点不一致：allocate 用 None 当 h_{-1}、append_slot 用别的哨兵 → decode 填满的块永远不会被 allocate 命中。</li>
+<li>驱逐时无条件 <code>del hash_to_block[h]</code>：同一哈希被两个块算出（内容相同）、映射指向另一个块时，会删掉别人的有效映射。</li>
+<li>free 用正序：尾部块（最不通用）变成“最新”从而最晚被驱逐，共享度最高的首块反而先死。</li>
+<li><code>can_allocate</code> 与 allocate 的检查混为一谈：前者粗（不看命中，偏保守），后者必须精确。</li>
+<li>命中 ref==0 的块时没移出可驱逐池；append 先 append token 再取块。</li>
+</ul>
+<h2 id="s5">逐步图：前缀共享 + 引用计数 + 可驱逐池（例 2）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ block_size=2, num_blocks=8, enable_prefix_cache=True</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. allocate(&quot;a&quot;, [1,2,3,4,5]) → [0, 1, 2]</div><p>块0=[1,2]、块1=[3,4] 是满块，登记 h0、h1；块2=[5] 不满，不登记。num_cached_tokens(&quot;a&quot;) = 0。</p>
+<p>ref：<span class="cells"><span class="cell on">1</span><span class="cell on">1</span><span class="cell on">1</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">2. allocate(&quot;b&quot;, [1,2,3,4,9]) → [0, 1, 3]</div><p>可匹配 (5-1)//2 = 2 块，两块都命中（ref+1）；块 3 是新块。num_cached_tokens(&quot;b&quot;) = 4，num_free_blocks = 4。</p>
+<p>ref：<span class="cells"><span class="cell on">2</span><span class="cell on">2</span><span class="cell on">1</span><span class="cell on">1</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">3. free(&quot;a&quot;)</div><p>逆序：块2 ref→0 无哈希 → 空闲表；块1、块0 ref→1。num_free_blocks = 5。</p>
+<p>ref：<span class="cells"><span class="cell on">1</span><span class="cell on">1</span><span class="cell ">0</span><span class="cell on">1</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">4. free(&quot;b&quot;)</div><p>逆序：块3 → 空闲表；块1、块0 ref→0 <strong>有哈希 → 可驱逐池 [1, 0]</strong>（块1 先入池 = 最旧）。num_free_blocks = 8（空闲 6 + 可驱逐 2）。</p>
+<p>ref：<span class="cells"><span class="cell w">0</span><span class="cell w">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span><span class="cell ">0</span></span>（绿色 = 在可驱逐池里）</p>
+</div><div class="step" data-hl=""><div class="step-title">5. allocate(&quot;c&quot;, [1,2,3,4]) → [0, 4]</div><p>只有 (4-1)//2 = <strong>1</strong> 块可匹配！块0 从可驱逐池“复活”；可驱逐池剩 [1]。num_cached_tokens(&quot;c&quot;) = 2。</p>
+<p>第二块 [3,4] 明明在缓存里，但“至少留 1 个 token 要算”的规则不允许命中，于是分配了新块 4。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1：不开前缀缓存</strong>（block_size=4, num_blocks=6，空闲表 FIFO）：</p>
+<pre><code>bm.allocate(&quot;x&quot;, [11, 12, 13, 14, 15, 16])   # -&gt; [0, 1]   ceil(6/4)=2 块
+bm.num_free_blocks                            # -&gt; 4        空闲表 [2, 3, 4, 5]
+bm.slot(&quot;x&quot;, 5)                               # -&gt; 5        = table[5//4]*4 + 5%4 = 1*4 + 1
+bm.append_slot(&quot;x&quot;, 17)                       # -&gt; 6        pos=6，块 1 还有空位
+bm.append_slot(&quot;x&quot;, 18)                       # -&gt; 7        pos=7，块 1 填满
+bm.append_slot(&quot;x&quot;, 19)                       # -&gt; 8        pos=8，需要第 3 块 -&gt; table [0, 1, 2]
+bm.num_free_blocks                            # -&gt; 3
+bm.free(&quot;x&quot;)                                  # 逆序归还 2, 1, 0 -&gt; 空闲表 [3, 4, 5, 2, 1, 0]
+bm.allocate(&quot;y&quot;, [1, 2, 3])                   # -&gt; [3]
+</code></pre>
+<p><strong>例 2</strong>：见逐步图。</p>
+<p><strong>例 3：命中可驱逐块也会占用名额——原子性陷阱</strong>（block_size=2, num_blocks=3）：</p>
+<pre><code>bm.allocate(&quot;a&quot;, [1, 2, 3, 4, 5]); bm.free(&quot;a&quot;)
+# 空闲表 [2]，可驱逐池 [1, 0]，num_free_blocks = 3
+bm.allocate(&quot;b&quot;, [1, 2, 3, 4, 5, 6, 7])   # 需要 4 块；命中块0、块1（都在可驱逐池里）
+# -&gt; raise OutOfBlocks
+bm.num_free_blocks                          # -&gt; 3，空闲表 [2]，可驱逐池 [1, 0]（完全没变）
+bm.allocate(&quot;b&quot;, [1, 2, 3, 4, 5, 6])        # -&gt; [0, 1, 2]，num_cached_tokens = 4，num_free_blocks -&gt; 0
+</code></pre>
+<p>第一次：需要新块 4−2=2 个，但“可用”的 3 块里有 2 块正是被命中的那两块，真正能当新块的只有 1 块，所以必须失败，且失败前不能动任何状态。</p>
+<h4>关键问题</h4>
+<ol>
+<li>prompt 10 个 token、bs=4：需要几块？哪几块是满块、会得到哈希？半满的块会不会进前缀缓存？</li>
+<li>prompt 恰好 8 个 token、bs=4，两块都已在缓存里。允许命中几块？num_cached_tokens 是多少？全部命中的话模型这一步能产出什么？</li>
+<li>两个块内容都是 [7, 8]，一个前面是 [1, 2]、一个前面是 [5, 6]。哈希应该相同吗？</li>
+<li>命中的块可能 ref&gt;0，也可能 ref==0。两种情况 allocate 时分别做什么？哪一种会让“可用块数”变少？</li>
+<li>从可驱逐池拿一个块装新内容时，除了移出池子，还必须清理哪两处记录？</li>
+<li>append_slot 新 token 的 pos 是多少？什么条件下拿新块？拿块失败时哪些状态已被你改掉了？</li>
+<li>free 时为什么逆序遍历？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>哈希链起点选一个固定哨兵（如 None）当 h_{-1}；allocate 和 append_slot 必须同一套规则。</li>
+<li>从头连续匹配——第一次 miss 就停。</li>
+<li><code>can_allocate(num_tokens)</code> 只是 <code>ceil(num_tokens/bs) &lt;= num_free_blocks</code> 的粗检查。</li>
+<li>enable_prefix_cache=False：不登记任何哈希，free 后的块全部回空闲表，num_cached_tokens 恒为 0。</li>
+<li>同内容多副本：哈希表里一个哈希只指向一个物理块；登记时若已存在保留旧的。驱逐时只有映射正指向这一块才删除。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><div class="table-wrap"><table>
+<thead>
+<tr>
+<th>结构</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>free: deque[int]</code></td>
+<td>无哈希的空闲块，popleft 取、append 还</td>
+</tr>
+<tr>
+<td><code>ref: list[int]</code></td>
+<td>每个物理块的引用计数</td>
+</tr>
+<tr>
+<td><code>block_hash: list[int|None]</code></td>
+<td>每个物理块当前登记的哈希（None = 不在缓存里）</td>
+</tr>
+<tr>
+<td><code>hash_to_block: dict[int,int]</code></td>
+<td>命中查找</td>
+</tr>
+<tr>
+<td><code>evictable: OrderedDict[int,None]</code></td>
+<td>ref==0 但仍有哈希的块，插入顺序 = LRU 顺序</td>
+</tr>
+<tr>
+<td><code>tables / tokens / hashes / cached: dict[seq_id, ...]</code></td>
+<td>每个序列的 block table、全部 token、哈希链、命中 token 数</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><strong>allocate = 先算、再查、最后改</strong>。容量检查公式：<code>新块数 = 总块数 − 命中数</code>；<code>真正可用 = num_free_blocks − 命中块中 ref==0 的个数</code>。只写 <code>新块数 &lt;= num_free_blocks</code> 时例 3 会“通过检查”，然后在取第 2 个新块时才 raise——此时命中块的 ref 已经加过了，状态被破坏。</li>
+<li><strong>取块 helper <code>_take_block()</code></strong>：空闲表非空就 popleft；否则从可驱逐池弹出最旧的，删除它的哈希登记（两处），否则 raise；最后 ref 设为 1。allocate 和 append_slot 都用它。</li>
+<li><strong>append_slot 顺序</strong>：<code>pos = len(tokens[seq])</code>；若 <code>pos // bs == len(table)</code> 先取新块；再 append token；若 <code>(pos + 1) % bs == 0</code> 用链尾当父节点算新哈希、追加进链并登记。最后返回 <code>slot(seq, pos)</code>。</li>
+<li><strong>free</strong>：逆序，ref−=1；归零看 block_hash：有 → 可驱逐池最新端，无 → 空闲表。删掉该序列的四份记录。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案与驱逐追踪<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>3 块；满块是第 0、1 块（token 0..7），各有哈希；第 2 块只有 2 个 token，不进缓存。</li>
+<li>只能命中 (8-1)//4 = 1 块，num_cached_tokens = 4。全命中的话没有任何 token 要 forward，拿不到最后位置的 logits，采样不出下一个 token。</li>
+<li>不同。链式哈希把前缀编码进去，防止“块内容相同但前缀不同”的块被误命中。</li>
+<li>ref&gt;0：只需 ref+1。ref==0：先从可驱逐池删掉再 ref=1；它原本算在 num_free_blocks 里，命中后不再可用，让“可用于新块的数量”减 1。</li>
+<li><code>block_hash[b]</code> 置 None，以及 <code>hash_to_block</code> 中指向 b 的映射。不清理：之后同前缀请求会“命中”被覆盖的块，KV 错乱。</li>
+<li>pos = 当前 token 数；条件 <code>pos // bs == len(table)</code>；拿块是第一步，失败时什么都还没改。</li>
+<li>逆序时最后一块最先进入可驱逐池，成为“最旧”，最先被驱逐；越靠前的前缀块（更可能被共享）越晚被驱逐。</li>
+</ol>
+</div></details>
+<p><strong>追踪：append 填满的块进入缓存，随后被驱逐</strong>（block_size=2, num_blocks=3）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>操作</th>
+<th>返回</th>
+<th>空闲表</th>
+<th>可驱逐池 (旧→新)</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>allocate(&quot;a&quot;,[7,8,9])</td>
+<td>[0, 1]</td>
+<td>[2]</td>
+<td>[]</td>
+<td>块0=[7,8] 满，登记 h0；块1=[9] 不满</td>
+</tr>
+<tr>
+<td>append_slot(&quot;a&quot;,10)</td>
+<td>3</td>
+<td>[2]</td>
+<td>[]</td>
+<td>pos=3 → 块1 offset 1；块1 刚满，用父哈希 h0 算 h1 并登记</td>
+</tr>
+<tr>
+<td>free(&quot;a&quot;)</td>
+<td></td>
+<td>[2]</td>
+<td>[1, 0]</td>
+<td>逆序：块1 先入池（最旧）</td>
+</tr>
+<tr>
+<td>allocate(&quot;b&quot;,[7,8,9,10,11])</td>
+<td>[0, 1, 2]</td>
+<td>[]</td>
+<td>[]</td>
+<td>可匹配 2 块，全中，num_cached_tokens=4</td>
+</tr>
+<tr>
+<td>free(&quot;b&quot;)</td>
+<td></td>
+<td>[2]</td>
+<td>[1, 0]</td>
+<td>块2=[11] 无哈希 → 空闲表</td>
+</tr>
+<tr>
+<td>allocate(&quot;z&quot;,[50..55])</td>
+<td>[2, 1, 0]</td>
+<td>[]</td>
+<td>[]</td>
+<td>先用空闲块 2，再驱逐 1、0，并删除 h1、h0 的登记</td>
+</tr>
+<tr>
+<td>free(&quot;z&quot;); allocate(&quot;b2&quot;,[7,8,9,10,11])</td>
+<td>??</td>
+<td></td>
+<td></td>
+<td>num_cached_tokens = ??（h0 还在吗？）</td>
+</tr>
+</tbody>
+</table></div>
+
+<details class="answer"><summary>最后一行</summary><div class="body"><p>返回 3 个新块、num_cached_tokens = 0——h0、h1 在驱逐时已被删除。</p>
+</div></details>
+<p><strong>自检</strong>：例 1~3 逐行跑一遍；再构造“同一块被两个序列共享、先 free 一个、再 free 另一个”，确认第一次 free 后 num_free_blocks 只增加了非共享的块。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>多模态 prompt 的 block hash 必须包含什么？</li>
+<li>多个 stage 共卡时，每个 stage 的 num_blocks 怎么定？</li>
+</ul>
+<p>对照源码：<code>vllm/v1/core/kv_cache_manager.py</code> · <code>vllm/v1/core/block_pool.py</code></p>
+<nav class="pager"><a class="prev" href="p07_overview.html"><small>← 上一题</small>#16 · P07 Scheduler：continuous batching + chunked prefill + 抢占</a><a class="next" href="p08_overview.html"><small>下一题 →</small>#18 · P08 批不变的采样器（per-request seed）</a></nav>
+</main>
+</body>
+</html>

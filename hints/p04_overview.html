@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P04 提示 · StagePool：粘性绑定、两阶段 abort、故障隔离</title>
+<meta name="description" content="每个 stage 可以有多个 replica：请求一旦落在某个 replica 上就必须一直在那（KV 在那）；客户端断开要 abort；某个 replica 进程死了，只能让绑定在它上面的请求失败。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p01_overview.html">← <span class="lbl">P01</span></a><a href="p05_overview.html"><span class="lbl">P05</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#12 · Track A · 前端与 Orchestrator · 书 p.57</div>
+<h1>P04 · StagePool：粘性绑定、两阶段 abort、故障隔离</h1>
+<p class="lede">每个 stage 可以有多个 replica：请求一旦落在某个 replica 上就必须一直在那（KV 在那）；客户端断开要 abort；某个 replica 进程死了，只能让绑定在它上面的请求失败。</p>
+<div class="badges">
+<span class="badge">⏱ <b>60 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p04_stage_pool_abort.py</code></span>
+<span class="badge">验收 <code>./check.sh p04</code></span>
+<span class="badge">提示 <b>A-12</b> · 参考解 <b>C-12</b> <code>solutions/p04_stage_pool_abort.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P04">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC · LIFE</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 1 + 例 2 的状态表（对存活列表取模）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：deploy 里 <code>num_replicas: 2</code> 会给一个 stage 起两个独立的 EngineCore 进程；orchestrator 为每个逻辑 stage 维护一个 <code>StagePool</code> 负责选 replica。</li>
+<li><strong>粘性绑定</strong>：请求的 KV cache、流式输入中间状态都在第一次分配到的 replica 上；后续 update / abort / 下一个 chunk 必须找同一个 replica。新请求在存活 replica 之间 round-robin。</li>
+<li><strong>两阶段 abort</strong>：</li>
+</ul>
+<pre><code>① partial = processor.collect_partial(rid)    # 只读：拿到已生成的部分文本，用于最后一条输出
+② for pool: await pool.abort([rid])           # 引擎侧真正停止；失败就抛出，不进入 ③
+③ processor.commit_abort(rid)                 # 提交：丢弃 detokenizer 状态
+return OrchOutput(rid, partial, finished=True, error=&quot;abort&quot;)
+</code></pre>
+<p>③ 先于 ②：引擎 abort 失败时 processor 已忘了这个请求，引擎却还在产出 token——孤儿输出。同一 replica 上的多个请求要<strong>合并成一次 abort 调用</strong>（一次 IPC）。</p>
+<ul>
+<li><strong>故障隔离</strong>：replica 崩溃（reader 收到 EngineDead）→ 标记死亡，只让绑定在它上面的请求以错误结束；其他照常；新请求不再分给它。全死了 <code>pick</code> 抛 <code>NoLiveReplica</code>。</li>
+</ul>
+<p><strong>验收要点</strong>：round-robin + 粘性 · evict 返回受影响请求、之后不再分配到死 replica、无存活时抛 NoLiveReplica · abort 按 replica 分组、每个 replica 只调用一次 · 两阶段顺序 collect → 各 stage abort → commit · abort 失败时不 commit、保留绑定以便重试 · 死 replica 只让绑定在它上面的请求失败。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">行李寄存柜台（粘性绑定）</div><p>火车站有 3 个寄存柜台（replica）。第一次来按顺序分到某个柜台（round-robin），行李（KV cache）就存在那。之后续存、取、退，必须回同一个柜台。某个柜台关门了（evict），就只在开着的柜台之间轮；关门时要通知在那儿存过东西的旅客（handle_dead_replica），并把登记本上这几行划掉——否则下次有人拿着旧登记去找，只会找到一扇关着的门。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">取消一张拆给好几家工厂的订单（两阶段 abort）</div><p>① 拍照（collect_partial，只读）：先把做好的半成品拍下来；② 通知每家工厂停工（await abort）：电话打不通就停下，<strong>别销账</strong>；③ 销账（commit_abort，不可逆）：所有工厂确认停工后才把订单从账本删掉；最后发“已取消”通知附上照片。先销账再打电话、电话又没打通：工厂继续做，货送回来账本上查无此单（孤儿输出），想重试照片也找不回来了。</p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC · LIFE</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>P04</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>全部跑在 orchestrator 同一个事件循环里；replica 是别的进程，但被 <code>ReplicaClient.abort</code> 包成可 await 的接口。没有线程，不需要锁</td>
+</tr>
+<tr>
+<td>S</td>
+<td>每个池：alive、<code>bindings: dict[rid → replica]</code>、round-robin 计数器；orchestrator 侧 PartialProcessor 里的部分结果。单写者</td>
+</tr>
+<tr>
+<td>B</td>
+<td>唯一的让出点是 <code>await replica.abort(ids)</code>；pick / bound / release / evict 都是同步方法，彼此不会交错</td>
+</tr>
+<tr>
+<td>W</td>
+<td>没有新 worker：调用方是 P02 的 request_handler（处理 abort）和 dispatcher（发现 replica 死亡）</td>
+</tr>
+<tr>
+<td>C</td>
+<td>add 和 abort 走同一条控制队列，“先 add 后 abort”的顺序不会乱；每次 replica 调用是一条 IPC，按 replica 合并</td>
+</tr>
+<tr>
+<td>L</td>
+<td>一个绑定的一生：pick 创建 → 正常结束 release / abort 成功后释放 / evict 时删除。三条路都要有，否则 bindings 只增不减</td>
+</tr>
+<tr>
+<td>I</td>
+<td>abort_request 要么返回恰好一条 <code>error=&quot;abort&quot;</code> 终态，要么抛异常且世界可重试；handle_dead_replica 对每个受影响请求恰好一条错误终态</td>
+</tr>
+<tr>
+<td>F</td>
+<td>① 绑定存在 ⇔ 那个 replica 上（可能）还有这个请求的状态；② 不可逆的 commit 永远排在所有可能失败的 abort 之后；③ pick 永不返回死 replica</td>
+</tr>
+<tr>
+<td>E</td>
+<td>无绑定 id → 静默忽略；部分 replica 失败 → 已成功的释放、失败的保留；全死 → NoLiveReplica；await 期间绑定可能已被删 → 释放时容忍“已经没了”</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>每个 id 调用一次 replica.abort：结果对，但 IPC 次数 = 请求数。</li>
+<li>await 之前就释放绑定：abort 失败后 bound() 变 None，重试时找不到 replica，请求在引擎里继续跑成孤儿。</li>
+<li>evict 只标记不删绑定：pick 可能对旧请求返回死 replica；之后 abort 这些请求会去调用死进程。</li>
+<li>用 <code>asyncio.gather</code> 并发所有组：一组失败时其他组可能成功也可能没执行完，绑定释放时机难以推理。</li>
+<li>commit 放在 abort 之前，或用 try/finally 保证 commit：abort 失败时前端已忘记请求，引擎却还在吐 token。</li>
+<li>“对全部 replica 取模再跳过死的”：死 replica 的下一个邻居多拿一份。</li>
+<li>遍历 dict 时删除（先收集再删）。</li>
+</ul>
+<h2 id="s5">逐步图：例 1 + 例 2 的状态表（对存活列表取模）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ p = StagePool(1, [A, B, C])</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 初始</div><p>alive = <span class="cells"><span class="cell ok">T</span><span class="cell ok">T</span><span class="cell ok">T</span></span>，bindings = {}，rr = 0</p>
+</div><div class="step" data-hl=""><div class="step-title">2. pick x / y / z / w</div><p>x → 0（rr 1），y → 1（rr 2），z → 2（rr 3），w → 0（rr 4）</p>
+<p>bindings = {x:0, y:1, z:2, w:0}</p>
+</div><div class="step" data-hl=""><div class="step-title">3. pick x（粘性命中）</div><p>已绑定且活着 → 原样返回 0，<strong>不推进 rr</strong>（仍是 4）。<code>p.bound(&quot;q&quot;)</code> → None（只读，不创建绑定）。</p>
+</div><div class="step" data-hl=""><div class="step-title">4. evict 1</div><p>alive = <span class="cells"><span class="cell ok">T</span><span class="cell bad">F</span><span class="cell ok">T</span></span>；返回 <code>['y']</code>，bindings = {x:0, z:2, w:0}</p>
+</div><div class="step" data-hl=""><div class="step-title">5. pick y / pick v</div><p>live = [0, 2]：y → <code>live[4 % 2] = 0</code>（rr 5）；v → <code>live[5 % 2] = 2</code>（rr 6）</p>
+<p>bindings = {x:0, z:2, w:0, y:0, v:2}</p>
+</div><div class="step" data-hl=""><div class="step-title">6. abort([x, z, w, ghost, v])</div><p>按绑定分组：A.abort([x, w])；C.abort([z, v])——每个 replica 恰好一次；ghost 无绑定忽略。</p>
+<p>之后 x/z/w/v 的 bound() 都是 None，bindings = {y:0}</p>
+</div><div class="step" data-hl=""><div class="step-title">7. 失败语义（另一个池 q = [A, B]，B.abort 抛错）</div><p>绑定 {m:0, n:1, o:0} → <code>await q.abort([&quot;m&quot;,&quot;n&quot;,&quot;o&quot;])</code>：A.abort([&quot;m&quot;,&quot;o&quot;]) 成功 → 释放 m、o；B.abort([&quot;n&quot;]) 抛 RuntimeError → <strong>n 保留</strong>，异常向上传播，可以重试。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>例 1、例 2 见上方逐步图。</p>
+<p><strong>例 3：两阶段 abort 与死 replica</strong>。三个 stage 池 s0/s1/s2，&quot;r9&quot; 分别绑在 T0、K1、W0；processor 里 r9 的部分文本 &quot;Hello wor&quot;：</p>
+<pre><code>out = await abort_request([s0, s1, s2], proc, &quot;r9&quot;)
+调用顺序：collect_partial(&quot;r9&quot;) -&gt; T0.abort([&quot;r9&quot;]) -&gt; K1.abort([&quot;r9&quot;]) -&gt; W0.abort([&quot;r9&quot;]) -&gt; commit_abort(&quot;r9&quot;)
+out == OrchOutput(&quot;r9&quot;, &quot;Hello wor&quot;, finished=True, error=&quot;abort&quot;)
+
+换一组池：s0 = [T0]，s1' = [K0]，K0.abort 会抛 RuntimeError
+await abort_request([s0, s1'], proc, &quot;r9&quot;)   # -&gt; 抛出 RuntimeError
+调用顺序：collect_partial -&gt; T0.abort([&quot;r9&quot;]) -&gt; K0.abort([&quot;r9&quot;]) 抛错    # 没有 commit_abort
+s0.bound(&quot;r9&quot;) is None（成功，已释放）；s1'.bound(&quot;r9&quot;) == 0（保留，可重试）
+</code></pre>
+<p>死 replica：<code>d = StagePool(2, [W0, W1])</code>，a,b,c 依次 pick 到 0,1,0。<code>handle_dead_replica(d, 0)</code> → a、c 各一条 <code>OrchOutput(..., None, finished=True, error=&quot;stage 2 replica 0 died&quot;)</code>；<code>d.bound(&quot;b&quot;) == 1</code>；<code>d.live_replicas() == [1]</code>；再 <code>d.evict(1)</code> 后 <code>d.pick(&quot;new&quot;)</code> 抛 NoLiveReplica。error 文字由你决定，非空、能说明原因即可。</p>
+<h4>关键问题</h4>
+<ol>
+<li>绑定表是什么形状？pick 对已绑定和未绑定的请求分别做什么？粘性命中时计数器要前进吗？</li>
+<li>round-robin 只在存活 replica 间轮转：“对存活列表取模”还是“对全部取模再跳过死的”？evict 后表现有什么不同？</li>
+<li>evict 为什么要删掉绑定而不是只标记死亡？</li>
+<li>abort(ids) 里 5 个 id 分布在 2 个 replica 上，应该产生几次调用？无绑定的 id 呢？没有 id 的 replica 要不要调用？</li>
+<li>例 2 中 A 成功、B 抛错：哪些绑定释放、哪些保留？为什么“先释放再 await”是错的？</li>
+<li>为什么 collect_partial 必须在引擎 abort 之前、commit_abort 必须在之后？</li>
+<li>abort_request 对一个根本没绑定 r9 的池调用 <code>pool.abort(['r9'])</code> 会怎样？需要在外面先判断吗？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>replica id = 下标；<code>live_replicas()</code> 按下标升序返回。</li>
+<li>bound 只读（没有就 None，不创建）；pick 可能创建；release 是正常结束时删除，对不存在的 id 不报错。</li>
+<li>本题的 <code>OrchOutput(request_id, data, finished, error)</code> 没有 stage_id 字段；abort 的终态 error 固定是 <code>&quot;abort&quot;</code>；死 replica 的终态 data 为 None。</li>
+<li>两阶段和数据库的 prepare/commit 是同一种思路：不可逆的那一步放在最后。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>状态</strong>：<code>alive: list[bool]</code>、<code>bindings: dict[str, int]</code>、round-robin 计数器；全部同步方法，唯一的 await 在 abort 里。</li>
+<li><strong>pick</strong>：已绑定且活着 → 返回；否则取存活列表，空则 NoLiveReplica；<code>live[rr % len(live)]</code>，rr += 1，写绑定。</li>
+<li><strong>evict</strong>：标记死亡 → 找出所有绑在它上面的 request → 删除 → 返回列表。</li>
+<li><strong>StagePool.abort</strong>：① 用绑定表分组成 <code>{replica: [ids]}</code>，无绑定跳过；② 对每组 <code>await replicas[rep].abort(ids)</code>，<strong>这一组成功返回之后</strong>再释放这组的绑定；③ 任一组抛错就传出去——已成功的组已释放，失败组和尚未处理的组保留。</li>
+<li><strong>abort_request</strong>：collect → 对每个 pool 顺序 <code>await pool.abort([rid])</code>（不要 try/except 吞错）→ commit → 返回终态。</li>
+<li><strong>handle_dead_replica</strong>：<code>pool.evict(replica)</code> + 每个受影响请求一条终态错误输出。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li><code>dict[request_id, replica_id]</code>。已绑定且活着 → 返回；否则轮转选择并写入。粘性命中不推进计数器（推进也不算错，但分配不均）。</li>
+<li>建议对存活列表取模：evict 后自动只在活着的里面均匀轮转；另一种写法要处理“跳过”且分布会偏。</li>
+<li>绑定代表“这个请求在那个 replica 上有状态”；replica 死了状态就没了，保留绑定会让 pick 返回死 replica、abort 调用死进程。删掉后这些请求已由 handle_dead_replica 发了错误终态。</li>
+<li>2 次（每个有 id 的 replica 一次）；无绑定的 id 忽略；没有 id 的 replica 不调用。</li>
+<li>A 那组（m、o）释放，B 那组（n）保留，异常抛出。先释放再 await：失败时绑定已经没了，重试无从下手。</li>
+<li>collect 在前：commit 会丢掉前端状态，之后拿不到部分文本；commit 在后：只有引擎都确认停止，前端才能安全地忘记这个请求。commit 在前 + abort 失败 = 引擎还在产出、前端不认识它（孤儿输出），而且用户已经收到 abort 终态。</li>
+<li>该池分组为空，不会产生任何 replica 调用，直接返回。不需要外面判断。</li>
+</ol>
+</div></details></div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>abort 和 ADD 在 EngineCore 内乱序会发生什么？（→ P10）</li>
+<li>多个 final stage 时，abort 的终态消息应该由谁发、发几次？</li>
+</ul>
+<p>对照源码：<code>engine/stage_pool.py:1279-1339</code> · <code>engine/stage_pool.py:333</code> · <code>engine/orchestrator.py:1464-1515</code> · <code>engine/orchestrator.py:645-731</code></p>
+<nav class="pager"><a class="prev" href="p01_overview.html"><small>← 上一题</small>#11 · P01 OutputSink：线程 → asyncio 的批量唤醒</a><a class="next" href="p05_overview.html"><small>下一题 →</small>#13 · P05 RpcRouter：共享通道上的 RPC 关联</a></nav>
+</main>
+</body>
+</html>

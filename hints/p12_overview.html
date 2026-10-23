@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P12 提示 · SharedMemoryConnector：跨进程 put/get 协议</title>
+<meta name="description" content="thinker 的 hidden states 每 token 都要发给 talker 进程：用 POSIX 共享内存，没有额外元数据通道——两边只靠 key 推出名字，用文件锁表达“写完了”。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p09_overview.html">← <span class="lbl">P09</span></a><a href="p13_overview.html"><span class="lbl">P13</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#20 · Track C · 数据面 · 书 p.88</div>
+<h1>P12 · SharedMemoryConnector：跨进程 put/get 协议</h1>
+<p class="lede">thinker 的 hidden states 每 token 都要发给 talker 进程：用 POSIX 共享内存，没有额外元数据通道——两边只靠 key 推出名字，用文件锁表达“写完了”。</p>
+<div class="badges">
+<span class="badge">⏱ <b>60 min</b></span>
+<span class="badge diff-难">难度 <b>难</b></span>
+<span class="badge">实现 <code>mine/p12_shm_connector.py</code></span>
+<span class="badge">验收 <code>./check.sh p12</code></span>
+<span class="badge">提示 <b>A-20</b> · 参考解 <b>C-20</b> <code>solutions/p12_shm_connector.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P12">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC · LIFE</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：一个 key 的生命周期（L = 锁文件，S = shm 段，T = 写者 tracker 中的登记）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：stage 之间的大块数据（hidden states、embedding、codec）不走 orchestrator，而由 worker 直接写进共享内存，下游 stage 的后台线程去读。同机部署默认就是 SharedMemoryConnector。</li>
+<li><strong>协议</strong>：</li>
+</ul>
+<pre><code>key  例如 &quot;req42_0_7&quot;（请求 42、stage 0 发出的第 7 块）
+name = 短哈希(key)                     # macOS 的 POSIX shm 名字最长 31 字节
+lock = &lt;lock_dir&gt;/&lt;name&gt;.lock
+
+put(key, data):                          get(key):
+  open(lock, O_CREAT); flock(EX)           open(lock)        → 不存在：None
+  创建 shm（若残留旧段，先 unlink）         flock(EX | NB)    → BlockingIOError：还在写，None
+  写 8 字节长度 + data                     打开 shm          → 不存在：None
+  flock(UN)                                读出 → close → unlink（读者释放）→ 删除 lock 文件
+</code></pre>
+<ul>
+<li><strong>8 字节长度头</strong>：shm 段大小会被向上取整到页，读者无法从段大小得知真实长度。</li>
+<li><strong>resource tracker 陷阱（测试会复现）</strong>：Python &lt; 3.13 中 <code>SharedMemory(create=True)</code> 会把段登记到创建者的 resource tracker。写进程先退出时，它的 tracker 把仍在登记中的段当“泄漏”删掉——读者再去读数据已经没了。解决：写完后把所有权转移给读者（从 tracker 注销），由读者 unlink。</li>
+<li><strong>生产者清理</strong>：请求被 abort 时下游可能永远不来读。生产者记住自己写过的 key，<code>cleanup_prefix(&quot;req42_&quot;)</code> 删除其中尚未被消费的段。</li>
+</ul>
+<p><strong>验收要点</strong>：往返且只能消费一次 · 空 payload 与 4MB payload · 独立写进程先退出 1 秒后读者仍能读到 · 锁被他人持有时 get 返回 None · cleanup_prefix 只清理未被消费的同前缀 key。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">小区的快递柜</div><p>共享内存段就是一个快递柜格子，key 是取件码。快递员（写者）和收件人（读者）从没见过面，但用同一张表从取件码算出同一个格子号（<code>shm_name(key)</code>）。每个格子门上有锁（锁文件 + flock）：快递员先锁门再放东西，放完才开锁；收件人先试着锁门，锁不上（LOCK_NB → BlockingIOError）说明还在放，转身就走、待会再来。格子都是标准大号（一页），所以快递员在最前面贴纸条“实际 N 字节”（长度头）。收件人取走后亲手退格子（unlink）并摘掉门上的锁（删锁文件）。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">物业的“退租清扫员”（resource tracker 陷阱）</div><p>每个 Python 进程都有一个物业清扫员（resource_tracker 子进程）。快递员租格子时物业把格子登记在他名下；快递员下班（进程退出）时清扫员一查：还没退的格子“肯定是忘了”——清空退掉，还在日志里抱怨 <code>leaked shared_memory objects</code>。可包裹收件人还没来取！解决：放好包裹后去物业把登记撤掉（<code>resource_tracker.unregister</code>），相当于过户给收件人。</p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC · LIFE</h2>
+<p>P12 的参与者是<strong>进程</strong>，不是线程或 task：进程之间不共享 Python 对象，<code>threading.Lock</code> 毫无意义；能用的只有内核提供的东西——共享内存段、文件、flock——以及双方约定好的协议（名字怎么算、谁创建、谁释放）。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>P12</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>写者进程、读者进程，外加容易被忘掉的第三方：每个进程自己的 resource_tracker 子进程。跨进程的同步原语只有 flock（建议性锁）</td>
+</tr>
+<tr>
+<td>S</td>
+<td>内核里：段（写者创建、读者 unlink）、锁文件（写者 O_CREAT、读者删除；它的存在本身就是状态：“有一个未被消费的 key”）、flock 的持有者。进程本地：写者“我写过的 key”集合、tracker 的登记表</td>
+</tr>
+<tr>
+<td>B</td>
+<td>写者的 <code>flock(LOCK_EX)</code> 可以阻塞（最多等读者读完一块）；读者永不阻塞：<code>LOCK_EX | LOCK_NB</code>，拿不到就返回 None，由 P13 的 recv 线程稍后重试</td>
+</tr>
+<tr>
+<td>W</td>
+<td>写者：创建 + 写 + 交出所有权。读者：读 + 拷贝 + 释放。tracker：进程退出时清扫仍登记着的段——你没写、但一定会运行的 worker</td>
+</tr>
+<tr>
+<td>C</td>
+<td>“名字”就是通道：<code>shm_name(key)</code> / <code>lock_path(key)</code> 两边独立计算。唯一的带内元数据是 8 字节长度头</td>
+</tr>
+<tr>
+<td>L</td>
+<td>段：写者 create → 写 → close（不 unlink）→ 从 tracker 注销 → 读者 attach → 拷贝 → close → unlink。锁文件：写者创建 → 读者删除。abort：写者 cleanup_prefix 回收</td>
+</tr>
+<tr>
+<td>F</td>
+<td>① 读者能锁上门时，段要么不存在、要么已完整写好；② 每个段恰好被 unlink 一次；③ 锁文件存在 ⇔ 这个 key 写过且没被消费；④ get 的每条 return 路径都解锁并关闭 fd</td>
+</tr>
+<tr>
+<td>E</td>
+<td>同名残留段（FileExistsError → 替换）；锁文件在而段不在；写者先退出；空与 4MB payload；前缀 &quot;spk3_&quot; 不能误伤 &quot;spk30_…&quot;</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>用 Python 的 <code>hash()</code> 算名字：不同进程有随机种子，两边算不出同一个名字；用 hashlib。</li>
+<li>名字太长：macOS 上限 31 字节（含前导 <code>/</code>）。</li>
+<li>只靠 <code>shm.size</code> 推断长度：读出整页；空 payload 因 size=0 无法创建（<code>ValueError: 'size' must be a positive number</code>）。</li>
+<li>先建段后拿锁：读者可能在两者之间拿到锁读到半成品。</li>
+<li>写者忘了 <code>resource_tracker.unregister</code>：写进程退出后读者拿到 None。</li>
+<li><code>data = shm.buf[8:8+n]</code> 后直接 <code>shm.close()</code>：BufferError（memoryview 还在）；要先 <code>bytes(...)</code> 拷贝。</li>
+<li>get 的某个 <code>return None</code> 分支没解锁/关 fd：fd 泄漏、锁一直挂着。</li>
+<li>锁文件在但段不在时抛异常或删锁文件：应返回 None 下次再来。</li>
+<li>cleanup_prefix 前缀匹配别的请求，或把已被消费的 key 也计数。</li>
+</ul>
+<h2 id="s5">逐步图：一个 key 的生命周期（L = 锁文件，S = shm 段，T = 写者 tracker 中的登记）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 此刻 get(k) 返回什么？</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. put 前</div><p>L 无 · S 无 → get 返回 <strong>None</strong>（锁文件不存在）</p>
+</div><div class="step" data-hl=""><div class="step-title">2. put：os.open 之后、flock 之前</div><p>L 有 · flock 无人持有 · S 无 → <strong>None</strong>（段不存在）——不要抛异常，也不要删锁文件</p>
+</div><div class="step" data-hl=""><div class="step-title">3. put：持锁写入中</div><p>L 有 · flock <strong>写者持有</strong> · S 有（未写完）· T 登记 → 已注销 → <strong>None</strong>（BlockingIOError）</p>
+</div><div class="step" data-hl=""><div class="step-title">4. put 返回后</div><p>L 有 · flock 无 · S 有 · T 无 → <strong>数据</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">5. 写者进程退出</div><p>L 有 · S 有（因为 T 里没有它）→ <strong>数据</strong></p>
+
+<details class="answer"><summary>如果写者没有注销，这一行的 S 会变成？</summary><div class="body"><p>无——写者的 tracker 在退出时把它 unlink 了，读者拿到 None。</p>
+</div></details></div><div class="step" data-hl=""><div class="step-title">6. get 成功后</div><p>L 无 · S 无（读者 unlink）→ 再 get 返回 <strong>None</strong></p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1：往返 + 只能消费一次</strong></p>
+<pre><code class="language-python">c = ShmConnector(namespace=&quot;hv&quot;); k = &quot;req7_0_0&quot;
+c.put(k, b&quot;abc&quot;)
+os.path.exists(c.lock_path(k))  -&gt; True     # put 结束后锁文件还在
+c.get(k)                        -&gt; b&quot;abc&quot;
+c.get(k)                        -&gt; None     # 读者已 unlink 段并删了锁文件
+c.get(&quot;never_written&quot;)          -&gt; None
+c.shm_name(k) == c.shm_name(k)  -&gt; True     # 确定性
+len(c.shm_name(k))              -&gt; 例如 23   # namespace + 短哈希；必须远小于 31
+c.put(k, b&quot;one&quot;); c.put(k, b&quot;two!&quot;)         # 同一个 key 写两次（旧段未被读）
+c.get(k)                        -&gt; b&quot;two!&quot;  # put 发现残留段 → 替换
+</code></pre>
+<p><strong>例 2：锁被别人持有 = 还在写</strong></p>
+<pre><code class="language-python">c.put(&quot;job_0_3&quot;, b&quot;xyz&quot;)
+fd = os.open(c.lock_path(&quot;job_0_3&quot;), os.O_RDWR); fcntl.flock(fd, fcntl.LOCK_EX)
+c.get(&quot;job_0_3&quot;)  -&gt; None          # 不阻塞，立即返回
+fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+c.get(&quot;job_0_3&quot;)  -&gt; b&quot;xyz&quot;
+</code></pre>
+<p>即使“别人”是同进程里另一次 os.open 得到的 fd，flock 也会冲突——flock 锁属于打开的文件描述（open file description），不属于进程。</p>
+<p><strong>例 3：cleanup_prefix</strong></p>
+<pre><code class="language-python">for i in range(3): c.put(f&quot;rA_0_{i}&quot;, bytes([i]))
+c.put(&quot;rAx_0_0&quot;, b&quot;q&quot;)
+c.get(&quot;rA_0_1&quot;)          -&gt; b&quot;\x01&quot;     # 被消费了一个
+c.cleanup_prefix(&quot;rA_&quot;)  -&gt; 2           # rA_0_0、rA_0_2；&quot;rAx_0_0&quot; 不以 &quot;rA_&quot; 开头
+c.cleanup_prefix(&quot;rA_&quot;)  -&gt; 0
+c.get(&quot;rA_0_0&quot;)          -&gt; None
+c.get(&quot;rAx_0_0&quot;)         -&gt; b&quot;q&quot;
+</code></pre>
+<h4>关键问题</h4>
+<ol>
+<li>读者只知道 key，怎么知道打开哪个段、哪个锁文件？这对 shm_name 提出了什么要求？</li>
+<li>为什么要 8 字节长度头？只靠 shm.size，3 字节 payload 会读出多少？<code>put(k, b&quot;&quot;)</code> 会怎样？</li>
+<li>get 返回 None 有三种原因，分别对应写者生命周期的哪个阶段？</li>
+<li>“先拿锁再创建段”和“先创建段再拿锁”有什么区别？</li>
+<li>谁负责 unlink 段？为什么不是写者？写者退出时谁会“好心”替它 unlink？</li>
+<li>cleanup_prefix 怎么判断一个自己写过的 key 已经被消费了？</li>
+<li>读者为什么要在 close() 之前就把数据 <code>bytes(...)</code> 拷出来？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li><code>SharedMemory(name=...)</code> 在 POSIX 上自动加 <code>/</code>；通常用 <code>namespace + &quot;_&quot; + hashlib 前 N 位</code>。</li>
+<li>macOS 上 <code>SharedMemory(create=True, size=5).size</code> 是 16384（一页）。</li>
+<li><code>fcntl.flock(fd, LOCK_EX)</code> 阻塞；<code>LOCK_EX | LOCK_NB</code> 拿不到抛 BlockingIOError。锁是建议性的。</li>
+<li>锁文件 = “存在一个未消费的 key”；lock_dir 为 None 时 Linux 用 /dev/shm，否则临时目录。</li>
+<li>resource tracker：创建（3.12 中附着也会）时登记，<code>unlink()</code> 会注销。读者“附着 → unlink”是平衡的；写者“创建 → 不 unlink”不平衡——所有权要显式转交。</li>
+<li>残留段：<code>create=True</code> 抛 FileExistsError，要替换而不是失败或追加。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li>状态只有：lock_dir、namespace、“我写过的 key”集合。<code>lock_path(key)</code> 由 <code>shm_name(key)</code> 派生。</li>
+<li><strong>put 的顺序</strong>：<code>os.open(lock, O_CREAT|O_RDWR)</code> → <code>flock(LOCK_EX)</code> → 创建段（FileExistsError 时附着旧段、close、unlink，再创建）→ 注销 tracker → 写长度头和数据 → <code>close()</code> → 记录 key → finally 里 LOCK_UN 并关 fd。锁必须在创建段之前拿到。</li>
+<li><strong>get 的顺序</strong>：<code>os.open(lock, O_RDWR)</code>（FileNotFoundError → None）→ <code>flock(LOCK_EX|LOCK_NB)</code>（BlockingIOError → None）→ 附着段（FileNotFoundError → None）→ 读长度、拷贝 → close → unlink → 删锁文件 → finally 解锁关 fd。</li>
+<li><strong>tracker 修复</strong>：<code>resource_tracker.unregister(shm._name, &quot;shared_memory&quot;)</code>（<code>_name</code> 带 <code>/</code> 前缀）；try/except 包住兼容不同版本。</li>
+<li><strong>cleanup_prefix</strong>：遍历记录的 key（先拍快照），前缀匹配的从记录中删除；锁文件还在（没人读过）就附着 + unlink 段、删锁文件，计数 +1；吞掉 FileNotFoundError。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>两边各自用 shm_name(key) / lock_path(key) 推出名字：确定性（用 hashlib 不用 hash()）、短（≤ 30 左右）、只含安全字符（十六进制即可）。</li>
+<li>只靠 shm.size 会读出整页（macOS 上 16384 字节）；空 payload 会因 size=0 无法创建。</li>
+<li>锁文件不存在（未写/已读）；锁被持有（正在写）；段不存在（写者刚创建锁文件还没建段）。</li>
+<li>先建段后拿锁：读者可能在两者之间拿到锁读出没写完的段；先锁后建段则不可能。</li>
+<li>读者负责 unlink：只有读者知道“已经用完了”。写者退出时它的 resource tracker 会替它 unlink——这正是要阻止的。</li>
+<li>读者成功 get 后会删锁文件，所以用 <code>os.path.exists(lock_path(key))</code> 判断。</li>
+<li>memoryview 切片持有 buffer 导出，close 会抛 BufferError；而且 close/unlink 之后内存可能已无效。</li>
+</ol>
+</div></details>
+<p><strong>思考</strong>：get 删锁文件时还持有 flock，这在“每个 key 只有一个消费者、key 不复用”的前提下是安全的；如果允许同一个 key 被反复写，会出现什么竞争？</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>同卡场景用 CUDA IPC 零拷贝：生命周期和跨进程流同步怎么保证？</li>
+<li>生产者如何在不等 ACK 的前提下回收自己的 bookkeeping？</li>
+</ul>
+<p>对照源码：<code>distributed/omni_connectors/connectors/shm_connector.py:195-364</code> · <code>entrypoints/stage_utils.py:193-237</code></p>
+<nav class="pager"><a class="prev" href="p09_overview.html"><small>← 上一题</small>#19 · P09 Paged KV 写入 + decode attention（参考实现）</a><a class="next" href="p13_overview.html"><small>下一题 →</small>#21 · P13 ChunkAdapter：后台收发线程与顺序/清理语义</a></nav>
+</main>
+</body>
+</html>

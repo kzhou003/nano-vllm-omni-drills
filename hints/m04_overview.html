@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M04 提示 · 多模态拼接：placeholder 计数、embedding 合并、DeepStack</title>
+<meta name="description" content="用户发来一段音频和一张图：前端必须提前知道要插多少个占位 token，thinker 要把编码器输出按顺序塞进这些位置，视觉特征还要通过 DeepStack 再注入前几层。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="m03_overview.html">← <span class="lbl">M03</span></a><a href="m05_overview.html"><span class="lbl">M05</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#4 · Track M · Qwen-Omni 模型实现 · 书 p.31</div>
+<h1>M04 · 多模态拼接：placeholder 计数、embedding 合并、DeepStack</h1>
+<p class="lede">用户发来一段音频和一张图：前端必须提前知道要插多少个占位 token，thinker 要把编码器输出按顺序塞进这些位置，视觉特征还要通过 DeepStack 再注入前几层。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/m04_mm_merge_deepstack.py</code></span>
+<span class="badge">验收 <code>./check.sh m04</code></span>
+<span class="badge">提示 <b>A-4</b> · 参考解 <b>C-4</b> <code>solutions/m04_mm_merge_deepstack.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="M04">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：merge 与 DeepStack</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：前端（API 进程）用 HF processor 把 <code>&lt;audio&gt;</code>、<code>&lt;image&gt;</code> 展开成 N 个占位 token——N 必须和编码器真实输出的 token 数完全一致。thinker 里 <code>inputs_embeds = embed_tokens(ids)</code>，再把 AuT 音频编码器与 ViT 的输出按顺序写进占位位置。</li>
+<li><strong>音频 token 数</strong>：AuT 以 100 帧 mel 为一窗，每个完整窗口经 3 次 stride-2 卷积得 13 个 token；余下 <code>r = n % 100</code> 帧同样过 3 次：</li>
+</ul>
+<pre><code>f = (r - 1) // 2 + 1
+tokens_r = ((f - 1) // 2 + 1 - 1) // 2 + 1
+total = tokens_r + 13 * (n // 100)        # 例：n = 100 -&gt; 13；n = 250 -&gt; 33
+</code></pre>
+<ul>
+<li><strong>Embedding 合并</strong>：每个模态 <code>mask = (input_ids == placeholder_id)</code>，<code>out[mask] = mm_embeds[modality]</code>（按出现顺序）。数量不一致必须报错——线上这类错误通常意味着前后端 processor 版本不一致。</li>
+<li><strong>DeepStack</strong>：ViT 从若干中间层各导出一份视觉特征；LLM 前 L 层中，<strong>第 i 层输出之后</strong>在视觉 token 的位置上把第 i 份特征加到 hidden 上。</li>
+<li><strong>边界</strong>：没有某模态时 mm_embeds 可以缺 key，但若存在占位符就必须报错；不要原地修改 text_embeds。</li>
+</ul>
+<p><strong>验收要点</strong>：音频 token 数与 HF <code>_get_feat_extract_output_lengths</code> 一致（含 100 的边界）· 图像/音频 embedding 按序落位、文本行不变、输入不被修改 · 数量不一致或缺 embedding 报错 · DeepStack 后整模型输出与 HF 一致 · DeepStack 只影响视觉行。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">用包占座</div><p>前端是提前进场的朋友：按“会来几个人”在一排座位上放包（占位 token）。编码器是后到的大巴，带来真正的乘客（embedding 行）。merge 就是“从左到右把包换成人”：第 k 个包的位置坐第 k 位乘客。图像和音频是两个旅行团，各自按自己的包排序，可以交错坐。人数和包数对不上——多一个少一个——都要当场报错。还有：不要在别人的座位表（<code>text_embeds</code>）上直接涂改，先复印一份（<code>clone</code>）。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">对折纸条：音频 token 数</div><p>每次 stride-2 卷积像把纸条对折：长度变成 <code>(len - 1) // 2 + 1</code>，即 ceil(len/2)。100 → 50 → 25 → 13，每个完整窗口贡献 13 个；只有不满 100 的尾巴需要真的折三次。余数为 0 时 <code>(0 - 1) // 2 + 1 = 0</code>——这依赖 floor division 向负无穷取整。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">炖汤分次加料：DeepStack</div><p>ViT 浅层特征偏“细节”，深层偏“语义”。DeepStack 按配方在第 i 次搅拌<strong>之后</strong>加入第 i 份料，而且只加进有蔬菜的那几碗（视觉行）。先加料再搅拌（注入放在 layer 之前）味道就不一样了——可是文本行根本没加料，只尝文本行是发现不了这个 bug 的。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>tensor</th>
+<th>shape</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>num_mel_frames</td>
+<td>int / <code>[B]</code></td>
+<td>余数窗口三次 <code>(len-1)//2+1</code> + 每个完整窗口 13；只用 <code>% // + - *</code>，int 和 tensor 都适用</td>
+</tr>
+<tr>
+<td>2</td>
+<td>input_ids</td>
+<td><code>[T]</code></td>
+<td>前端已按 token 数展开占位符</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>masks[m]</code></td>
+<td>bool <code>[T]</code></td>
+<td><code>input_ids == placeholder_ids[m]</code>；每个模态都返回（没出现就是全 False）</td>
+</tr>
+<tr>
+<td>4</td>
+<td>校验</td>
+<td>—</td>
+<td><code>mask.sum()</code> vs <code>mm_embeds[m].shape[0]</code>；缺 embedding 但有占位也报错</td>
+</tr>
+<tr>
+<td>5</td>
+<td>inputs_embeds</td>
+<td><code>[T, H]</code></td>
+<td><code>text_embeds.clone()</code>，布尔索引按升序位置写入第 0, 1, 2… 行（转成输出 dtype）</td>
+</tr>
+<tr>
+<td>6</td>
+<td>layer i</td>
+<td><code>[T, H]</code></td>
+<td><code>hidden = layer(hidden)</code></td>
+</tr>
+<tr>
+<td>7</td>
+<td>DeepStack i</td>
+<td><code>hidden[visual_mask]: [n_vis, H]</code></td>
+<td>i &lt; K 时在视觉行上加 <code>deepstack[i]</code>，返回新 tensor</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li><code>audio_token_count</code> 里用 <code>if r == 0</code>、<code>int()</code>、<code>math.floor</code>：对多元素 tensor 不可用；公式本身已正确给出 0。</li>
+<li><code>out = text_embeds</code> 没有 clone，写入变成原地修改调用方的 tensor。</li>
+<li>以 mm_embeds 为主循环：漏掉“有占位符但没给 embedding”的报错。</li>
+<li>数量不一致时截断 / 补零而不是报错。</li>
+<li>DeepStack 注入放在 layer 调用<strong>之前</strong>（off-by-one），或 <code>zip(layers, deepstack)</code> 把多出来的 layer 跳过了。</li>
+<li><code>hidden[visual_mask] += …</code> 原地改了输入；或 <code>out += visual_embeds</code>（n_vis 行对 T 行）。</li>
+</ul>
+<h2 id="s5">逐步图：merge 与 DeepStack</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 从占位符到 DeepStack 注入</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 占位符与 mask</div><p>H = 2，image 占位 id = 90，audio 占位 id = 91：</p>
+<pre><code>input_ids   = [7, 90, 90, 8, 91, 91, 9]
+</code></pre>
+<p>image mask：<span class="cells"><span class="cell off">F</span><span class="cell t">T</span><span class="cell t">T</span><span class="cell off">F</span><span class="cell off">F</span><span class="cell off">F</span><span class="cell off">F</span></span><br />
+audio mask：<span class="cells"><span class="cell off">F</span><span class="cell off">F</span><span class="cell off">F</span><span class="cell off">F</span><span class="cell w">T</span><span class="cell w">T</span><span class="cell off">F</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">2. 按序替换（clone 后写入）</div><pre><code>mm_embeds = {&quot;image&quot;: [[100,100],[200,200]], &quot;audio&quot;: [[-1,-1],[-2,-2]]}
+inputs_embeds = [[ 0,  1],
+                 [100,100],   # image #0
+                 [200,200],   # image #1
+                 [ 6,  7],
+                 [ -1, -1],   # audio #0
+                 [ -2, -2],   # audio #1
+                 [ 12, 13]]
+</code></pre>
+<p><code>out[mask] = emb</code> 按 True 的<strong>升序位置</strong>依次写入 emb 的第 0, 1, … 行——正好就是“按顺序”。调用后 text_embeds 必须仍是原值。</p>
+</div><div class="step" data-hl=""><div class="step-title">3. 报错情况</div><div class="table-wrap"><table>
+<thead>
+<tr>
+<th>输入</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ids = [90, 90, 5]</code>，<code>mm_embeds = {&quot;image&quot;: 1 行}</code></td>
+<td>ValueError（2 个占位 vs 1 行）</td>
+</tr>
+<tr>
+<td><code>ids = [91, 5]</code>，<code>placeholder_ids = {&quot;audio&quot;: 91}</code>，<code>mm_embeds = {}</code></td>
+<td>ValueError（有占位符但没有 embedding）</td>
+</tr>
+<tr>
+<td><code>ids = [7, 8]</code>，<code>mm_embeds = {}</code></td>
+<td>正常返回（没有占位符，缺 key 合法）</td>
+</tr>
+</tbody>
+</table></div>
+</div><div class="step" data-hl=""><div class="step-title">4. run_layers：level i 在 layer i 之后</div><p><code>layers = [*2, +10, *3]</code>，<code>hidden = ones(3,1)</code>，<code>visual_mask = [T, F, T]</code>，<code>deepstack = [[[1],[5]], [[100],[200]]]</code>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>row0</th>
+<th>row1</th>
+<th>row2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>layer0 (*2)</td>
+<td>2</td>
+<td>2</td>
+<td>2</td>
+</tr>
+<tr>
+<td>+ level 0</td>
+<td><strong>3</strong></td>
+<td>2</td>
+<td><strong>7</strong></td>
+</tr>
+<tr>
+<td>layer1 (+10)</td>
+<td>13</td>
+<td>12</td>
+<td>17</td>
+</tr>
+<tr>
+<td>+ level 1</td>
+<td><strong>113</strong></td>
+<td>12</td>
+<td><strong>217</strong></td>
+</tr>
+<tr>
+<td>layer2 (*3)</td>
+<td>339</td>
+<td>36</td>
+<td>651</td>
+</tr>
+</tbody>
+</table></div>
+<p>level 只有 2 个，layer2 之后不注入。结果 <code>[[339], [36], [651]]</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">5. 错把注入放在 layer 之前</div><p>会得到 <code>[[342], [36], [666]]</code>——<strong>非视觉行（row1）完全不受影响</strong>，所以只看文本行永远发现不了这个 bug，HF 对拍才会失败。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>audio_token_count</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>n</th>
+<th>n // 100</th>
+<th>余数 r</th>
+<th>f → 第二次 → 第三次</th>
+<th>total</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0→0→0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>50</td>
+<td>0</td>
+<td>50</td>
+<td>25 → 13 → 7</td>
+<td>7</td>
+</tr>
+<tr>
+<td>99</td>
+<td>0</td>
+<td>99</td>
+<td>50 → 25 → 13</td>
+<td>13</td>
+</tr>
+<tr>
+<td>100</td>
+<td>1</td>
+<td>0</td>
+<td>0→0→0</td>
+<td>13</td>
+</tr>
+<tr>
+<td>101</td>
+<td>1</td>
+<td>1</td>
+<td>1→1→1</td>
+<td>14</td>
+</tr>
+<tr>
+<td>330</td>
+<td>3</td>
+<td>30</td>
+<td>15 → 8 → 4</td>
+<td>43</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>audio_token_count(torch.tensor([50, 100, 330])) → tensor([7, 13, 43])</code>。注意 99 与 100 都是 13，101 跳到 14。</p>
+<p><strong>apply_deepstack</strong>：<code>apply_deepstack(hidden=zeros(4, 2), visual_mask=[F, T, T, F], visual_embeds=[[1,1],[2,2]])</code> → <code>[[0,0],[1,1],[2,2],[0,0]]</code>，hidden 本身仍是全 0。</p>
+<p>merge 与 run_layers 的数字见上方逐步图。纯文本（无占位符、<code>mm_embeds = {}</code>）时输出等于 text_embeds 的一份拷贝，masks 中每个模态都是全 False。</p>
+<h4>关键问题</h4>
+<ol>
+<li>audio_token_count 要同时支持 int 和 LongTensor。哪些写法（<code>math.floor</code>、<code>int(...)</code>、if 分支）会在 tensor 输入下出问题？只用哪些运算符就够了？</li>
+<li>r = 0 时 <code>(r - 1) // 2 + 1</code> 给出多少？这依赖 <code>//</code> 对负数的什么行为？</li>
+<li>“按顺序”替换是什么意思？第 k 个占位符位置取 mm_embeds 的第几行？<code>out[mask] = emb</code> 能保证吗？</li>
+<li>怎样保证 text_embeds 不被修改？<code>out = text_embeds</code> 之后再写会发生什么？</li>
+<li>某模态在 placeholder_ids 里但不在 mm_embeds 里，什么时候报错、什么时候静默跳过？</li>
+<li>visual_embeds 的行数和 visual_mask 什么关系？<code>hidden[visual_mask]</code> 形状是多少？</li>
+<li>L 个 layer、K 个 level（K &lt; L），哪几个 layer 之后会注入？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>公式来历：100 帧 → 50 → 25 → 13；前端 processor 必须用同一个公式算占位符个数。</li>
+<li><code>% // + - *</code> 对 int 和 LongTensor 都是逐元素整数语义；对负数两者的 <code>//</code> 都是 floor，所以 <code>(-1) // 2 = -1</code>。</li>
+<li>masks 对 placeholder_ids 里的每个模态都要有一项；DeepStack 的 visual_mask 就来自这里。</li>
+<li>不同模态的占位符可以交错，每个模态各自计数。</li>
+<li>编码器输出 dtype 可能与 text_embeds 不同（ViT fp32、LLM bf16），写入前转成输出 dtype；DeepStack 加法同理。</li>
+<li>DeepStack 是“加”不是“替换”，并返回新 tensor。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>audio_token_count</strong>：一行表达式即可：<code>r = n % 100</code> → 三次 <code>(len - 1) // 2 + 1</code> → 加 <code>13 * (n // 100)</code>。不要写分支。</li>
+<li><strong>merge 的循环</strong>：先 <code>out = text_embeds.clone()</code>；对 placeholder_ids 的每个 (modality, token_id)：算 mask、存进 masks、统计 n；再看 mm_embeds 里有没有。<strong>以 placeholder_ids 为主循环</strong>，“有占位符却缺 embedding”自然被覆盖。</li>
+<li><strong>校验</strong>：缺模态时 n &gt; 0 → ValueError，n == 0 → 跳过；存在时 <code>emb.shape[0] != n</code> → ValueError。错误消息带上模态名和两边数量。</li>
+<li><strong>写入</strong>：<code>out[mask] = emb.to(out.dtype)</code>。易错：<code>out[mask.nonzero()] = emb</code> 多一维；<code>torch.where(mask[:, None], emb, out)</code> 形状对不上。</li>
+<li><strong>apply_deepstack</strong>：<code>out = hidden.clone()</code>；<code>out[visual_mask] = out[visual_mask] + visual_embeds</code>。</li>
+<li><strong>run_layers</strong>：<code>for i, layer in enumerate(layers)</code>：先 <code>hidden = layer(hidden)</code>，再 <code>i &lt; len(deepstack_embeds)</code> 时注入。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li><code>math.floor</code>、<code>int(n)</code>、<code>if r == 0</code> 都不能用于多元素 tensor；只用 <code>% // + - *</code>。</li>
+<li><code>(0 - 1) // 2 + 1 = -1 + 1 = 0</code>，后两步也是 0；依赖 floor division。C 风格截断除法会得到 1，100 帧会被错算成 14。</li>
+<li>第 k 个 True 位置取第 k 行；布尔索引赋值按位置升序写入，能保证。</li>
+<li><code>clone()</code>；不 clone 时 out 与 text_embeds 是同一块内存。</li>
+<li>缺 embedding 且该模态有 ≥1 个占位符 → 报错；占位符数为 0 → 跳过（mask 仍要返回）。</li>
+<li><code>visual_embeds.shape[0] == visual_mask.sum()</code>；<code>hidden[visual_mask]</code> 是 <code>[n_vis, H]</code>。</li>
+<li>layer 0 … K-1 之后各注入一次，level i ↔ layer i（0-based）。</li>
+</ol>
+</div></details>
+<p><strong>核对</strong>：image mask 的 True 位置是 1、2，于是第 1 行 ← image[0] = [100,100]，第 2 行 ← image[1]；audio 的 4、5 同理。DeepStack 第 0 行：1 →(*2) 2 →(+1) 3 →(+10) 13 →(+100) 113 →(*3) 339；第 1 行不是视觉行：1 → 2 → 12 → 36。</p>
+<p><strong>与 serving 的联系</strong>：audio_token_count 在 API 进程（HF processor）里决定 prompt 长度，merge_multimodal 在 thinker stage 里消费编码器输出——两处公式不一致时，报错发生在 merge 的数量校验处，所以校验必须严格而不能“截断/补零”。DeepStack 的 visual_mask 就是 merge 返回的 image（及 video）mask。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>chunked prefill 时一张图被切在两个 chunk 之间，编码器输出与 DeepStack 特征怎么分发？</li>
+<li>vllm-omni 的 encoder cache 以什么为 key？</li>
+</ul>
+<p>对照源码：<code>model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py:1018</code> · <code>:1137-1168</code> · <code>:605-606</code> · HF <code>_get_feat_extract_output_lengths</code> · HF <code>Qwen3OmniMoeThinkerTextModel._deepstack_process</code></p>
+<nav class="pager"><a class="prev" href="m03_overview.html"><small>← 上一题</small>#3 · M03 Sparse MoE：路由、按 expert 分组计算、shared expert</a><a class="next" href="m05_overview.html"><small>下一题 →</small>#5 · M05 Talker MTP：一帧内预测 15 个残差 codebook</a></nav>
+</main>
+</body>
+</html>

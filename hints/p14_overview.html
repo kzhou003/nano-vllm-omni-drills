@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P14 提示 · Codec 窗口规划：首块小、后块大、左上下文</title>
+<meta name="description" content="TTFP 要低（首块只要 4 帧），吞吐要高（之后 25 帧一块），接缝要无损（左上下文重算后切片）——三个目标落在两个纯函数里。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p15_overview.html">← <span class="lbl">P15</span></a><a href="p18_overview.html"><span class="lbl">P18</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#23 · Track D · 模型胶水（纯函数） · 书 p.99</div>
+<h1>P14 · Codec 窗口规划：首块小、后块大、左上下文</h1>
+<p class="lede">TTFP 要低（首块只要 4 帧），吞吐要高（之后 25 帧一块），接缝要无损（左上下文重算后切片）——三个目标落在两个纯函数里。</p>
+<div class="badges">
+<span class="badge">⏱ <b>40 min</b></span>
+<span class="badge diff-易">难度 <b>易</b></span>
+<span class="badge">实现 <code>mine/p14_codec_windows.py</code></span>
+<span class="badge">验收 <code>./check.sh p14</code></span>
+<span class="badge">提示 <b>A-23</b> · 参考解 <b>C-23</b> <code>solutions/p14_codec_windows.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P14">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · 一个窗口的一生（以 (5, 9, 15)、upsample=4 为例）</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：initial=2, chunk=5, left_ctx=3</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：talker 每步产出 1 帧 codec，攒成窗口发给 code2wav；code2wav 每个窗口独立解码（无状态，便于 batch）。Qwen3-Omni 默认 <code>initial_codec_chunk_frames=4, codec_chunk_frames=25, codec_left_context_frames=25</code>。</li>
+</ul>
+<pre><code>next_window(available, emitted, finished) -&gt; (ctx_start, new_start, new_end) | None
+  size = initial（第一块且 initial&gt;0）否则 chunk
+  available - emitted ≥ size        → new_end = emitted + size
+  finished 且还有剩余                → new_end = available     （尾部 flush）
+  否则                               → None（继续等）
+  new_start = emitted;  ctx_start = max(0, new_start - left_ctx)
+
+code2wav 解码 codes[ctx_start:new_end]，得到 (new_end-ctx_start)·up 个样本，
+只输出属于 [new_start, new_end) 的那一段（左上下文重算但不重复输出）
+</code></pre>
+<ul>
+<li><strong>为什么左上下文能消除接缝</strong>：vocoder 是因果的、感受野有限：样本只依赖最近 r 帧。只要 <code>left_ctx ≥ r</code>，窗口内新帧看到的上下文就与整段解码完全相同——测试用一个感受野可控的玩具 vocoder 证明这一点（以及不足时确实出现接缝）。</li>
+</ul>
+<p><strong>验收要点</strong>：首块/稳态/尾部 flush 的精确窗口 · 无首块配置 · 随机到达模式下窗口恰好平铺、无重叠无空洞 · 左上下文 ≥ 感受野时流式 == 整段解码；不足时出现接缝。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">同声传译</div><p>译员不会等演讲者讲完一整段才开口（TTFP 高），先听两三个词就翻第一句（小的首块），之后每次听一整句再翻（大块，更流畅）。每次开始翻新一句时，他会回想上一句的最后几个词，好让语气和指代接得上（左上下文）——这几个词不会再说一遍。演讲结束时，剩下的半句也要翻出来（finished 时 flush）。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">电视剧的“前情提要”</div><p>每一集（窗口）开头都放一段“前情提要”（<code>[ctx_start, new_start)</code>），让观众（vocoder）进入状态。剪成一部完整电影时必须把每集的提要剪掉，否则同一段剧情出现两次——<code>slice_new_samples</code> 就是那把剪刀。提要至少要覆盖观众需要的记忆长度（感受野），太短开场几秒就会“断片”——接缝。</p>
+</div>
+<h2 id="s3">框架视角 · 一个窗口的一生（以 (5, 9, 15)、upsample=4 为例）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>量</th>
+<th>坐标 / 形状</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>available, emitted</td>
+<td>标量，全局帧数</td>
+<td>17, 9：已产出 17 帧，前 9 帧已发过</td>
+</tr>
+<tr>
+<td>2</td>
+<td>size</td>
+<td>帧数</td>
+<td>不是首块 → 用 chunk = 6</td>
+</tr>
+<tr>
+<td>3</td>
+<td>(ctx_start, new_start, new_end)</td>
+<td>全局帧下标</td>
+<td>(5, 9, 15)：上下文 5..8，新帧 9..14；15、16 留给下一次</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>codes[ctx_start:new_end]</code></td>
+<td>10 帧</td>
+<td>发给 code2wav 的那段</td>
+</tr>
+<tr>
+<td>5</td>
+<td>decoded</td>
+<td><code>[(15-5)·4] = [40]</code>，局部样本坐标</td>
+<td>下标 0 对应全局帧 5 的第一个样本</td>
+</tr>
+<tr>
+<td>6</td>
+<td>切片起点</td>
+<td><code>(9-5)·4 = 16</code></td>
+<td>把“全局帧 9”换算成局部样本下标</td>
+</tr>
+<tr>
+<td>7</td>
+<td>返回值</td>
+<td><code>[24]</code> = 6 帧 × 4</td>
+<td>只输出新帧；所有窗口首尾相接 = 17×4 = 68 个样本</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>首块判断用“还没发过任何帧”（emitted == 0）且 initial &gt; 0；别用 available 去猜——帧可能一次来很多。</li>
+<li>判断顺序：先看“够不够一个完整窗口”，再看“是否 finished 且有剩余”；finished 不等于“把剩下的全部打包”。</li>
+<li>不要返回空窗口：流结束且全部发完时返回 None，否则调用方的 while 循环永远停不下来。</li>
+<li>ctx_start 不能为负。</li>
+<li>局部 vs 全局坐标：decoded 从 ctx_start 开始计数；用 <code>new_start·upsample</code> 直接切是最常见的 bug（只在 ctx_start=0 时碰巧对）。</li>
+<li><code>left_ctx ≥ 感受野</code> 才能逐样本无接缝；这依赖 vocoder “因果 + 局部”。</li>
+</ul>
+<h2 id="s5">逐步图：initial=2, chunk=5, left_ctx=3</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 逐个调用 next_window</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. (available=1, emitted=0, F)</div><p>首块要 2 帧，只有 1 帧 → <strong>None</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">2. (2, 0, F)</div><p>size = 2（首块）→ <strong>(0, 0, 2)</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">3. (6, 2, F)</div><p>size = 5，只有 4 帧新帧，未结束 → <strong>None</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">4. (7, 2, F)</div><p>→ <strong>(0, 2, 7)</strong>，ctx_start = max(0, 2−3) = 0（左上下文被 0 截断）</p>
+</div><div class="step" data-hl=""><div class="step-title">5. (12, 7, F)</div><p>→ <strong>(4, 7, 12)</strong>：左上下文 3 帧 4,5,6</p>
+<p>帧：<span class="cells"><span class="cell off">0</span><span class="cell off">1</span><span class="cell off">2</span><span class="cell off">3</span><span class="cell h">4</span><span class="cell h">5</span><span class="cell h">6</span><span class="cell t">7</span><span class="cell t">8</span><span class="cell t">9</span><span class="cell t">10</span><span class="cell t">11</span></span>（橙 = 上下文，蓝 = 新帧）</p>
+</div><div class="step" data-hl=""><div class="step-title">6. (20, 12, T)</div><p>finished，但完整的一块还够 → 仍按 5 帧切：<strong>(9, 12, 17)</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">7. (20, 17, T)</div><details class="answer"><summary>size？差值？分支？结果？</summary><div class="body"><p>size=5，差值 3，不够完整一块 → flush，new_end=20，ctx_start=14 → <strong>(14, 17, 20)</strong></p>
+</div></details></div><div class="step" data-hl=""><div class="step-title">8. (20, 20, T)</div><p>全部发完 → <strong>None</strong>（返回空窗口会让循环永不结束）</p>
+</div><div class="step" data-hl=""><div class="step-title">9. 很短的流 (1, 0, T)</div><p>首块都凑不满，直接 flush → <strong>(0, 0, 1)</strong></p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>例 1 见逐步图。没有首块配置：<code>next_window(6, 0, False, initial=0, chunk=6, left_ctx=10) -&gt; (0, 0, 6)</code>，<code>next_window(12, 6, False, ...) -&gt; (0, 6, 12)</code>。</p>
+<p><strong>例 2：slice_new_samples</strong></p>
+<pre><code>window = (4, 7, 12), upsample = 2
+decoded = vocoder(codes[4:12])             # 8 帧 × 2 = 16 个样本: s0 .. s15
+                                           # s0..s5 属于上下文帧 4,5,6；s6..s15 属于新帧 7..11
+slice_new_samples(decoded, (4, 7, 12), 2) -&gt; [s6, ..., s15]
+slice_new_samples([0, 1, 2, 3], (0, 0, 2), 2) -&gt; [0, 1, 2, 3]     # 没有左上下文时整段都是新的
+</code></pre>
+<p><strong>例 3：一次完整的流</strong>（initial=2, chunk=5, left_ctx=3，共 14 帧分 6 批到达）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>批次</th>
+<th>本批帧数</th>
+<th>available</th>
+<th>finished</th>
+<th>本批循环得到的窗口</th>
+<th>之后 emitted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>1</td>
+<td>1</td>
+<td>F</td>
+<td>（无）</td>
+<td>0</td>
+</tr>
+<tr>
+<td>1</td>
+<td>2</td>
+<td>3</td>
+<td>F</td>
+<td>(0, 0, 2)</td>
+<td>2</td>
+</tr>
+<tr>
+<td>2</td>
+<td>4</td>
+<td>7</td>
+<td>F</td>
+<td>(0, 2, 7)</td>
+<td>7</td>
+</tr>
+<tr>
+<td>3</td>
+<td>3</td>
+<td>10</td>
+<td>F</td>
+<td>（无）</td>
+<td>7</td>
+</tr>
+<tr>
+<td>4</td>
+<td>1</td>
+<td>11</td>
+<td>F</td>
+<td>（无）</td>
+<td>7</td>
+</tr>
+<tr>
+<td>5</td>
+<td>3</td>
+<td>14</td>
+<td>T</td>
+<td>(4, 7, 12), (9, 12, 14)</td>
+<td>14</td>
+</tr>
+</tbody>
+</table></div>
+<p>调用者每批循环调用 next_window 直到 None，每拿到一个窗口令 <code>emitted = new_end</code>；所有 <code>[new_start, new_end)</code> 恰好拼成 [0, 14)。</p>
+<h4>关键问题</h4>
+<ol>
+<li>函数没有内部状态，“第一个窗口”怎么从参数里判断？</li>
+<li>initial=0 表示什么？此时首块用多大？</li>
+<li>finished=True 但剩余 ≥ 一个完整窗口时，一次发出全部剩余还是仍按 chunk 切？</li>
+<li>finished 且 available == emitted 时返回什么？返回 <code>(…, 20, 20)</code> 会怎样？</li>
+<li>ctx_start 为什么不能为负？它和 emitted 之间的帧被解码几次、输出几次？</li>
+<li>decoded 的第 i 个样本属于窗口里第几帧？new_start 的第一个样本在 decoded 中的下标？</li>
+<li>left_ctx 要多大，流式结果才和整段解码逐样本相同？依赖 vocoder 的什么性质？</li>
+</ol>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>next_window 三步</strong>：① 算 size（首块判断：<code>emitted == 0 and initial &gt; 0</code>）；② 决定 new_end：完整窗口 / flush / None；③ 由 emitted 和 left_ctx 算 new_start、ctx_start。</li>
+<li><strong>判断顺序</strong>：先完整窗口，再 flush。把 finished 放前面，<code>(20, 12, True)</code> 会返回 <code>(9, 12, 20)</code>——不丢帧，但违反“完整窗口可用时返回完整窗口”。</li>
+<li><strong>flush 条件</strong>要求 <code>available &gt; emitted</code>。</li>
+<li><strong>slice 公式</strong>：起点 <code>(new_start − ctx_start) * upsample</code>，终点 <code>(new_end − ctx_start) * upsample</code>（即 len(decoded)）。用全局 <code>new_start * upsample</code> 切局部 decoded，例 2 会得到 <code>decoded[14:24]</code>，只剩 2 个样本。</li>
+<li>可加断言 <code>len(decoded) == (new_end − ctx_start) * upsample</code>。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案与接缝例子<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>首块 ⇔ <code>emitted == 0</code>（还没发出过任何帧）且 <code>initial &gt; 0</code>。</li>
+<li>没有特殊首块，首块也用 chunk。</li>
+<li>仍然按 chunk 切；剩下不足一块时才 flush。</li>
+<li>None；返回空窗口会让 emitted 停在原地，循环永不结束。</li>
+<li>流开头 <code>new_start − left_ctx</code> 可能为负，帧下标没有负数。上下文帧会被解码不止一次（作为上一窗口新帧一次，作为下一窗口上下文再一次），但只输出一次。</li>
+<li>decoded[i] 属于局部帧 <code>i // upsample</code>，即全局帧 <code>ctx_start + i // upsample</code>；new_start 的第一个样本在 <code>(new_start − ctx_start) * upsample</code>。</li>
+<li>left_ctx ≥ vocoder 的（因果）感受野；依赖“因果 + 局部”。</li>
+</ol>
+</div></details>
+<p><strong>左上下文 vs 感受野：一个能手算的例子</strong>。玩具 vocoder：帧 i 输出 2 个样本 <code>[10·S, 10·S+1]</code>，S = 窗口内 <code>codes[max(0,i−2) .. i]</code> 之和（感受野 r=2，只看窗口内部）。<code>codes = [3,1,4,1,5,9,2,6]</code>，initial=3, chunk=3，一次性全部可用。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>left_ctx</th>
+<th>窗口</th>
+<th>本窗口 decoded</th>
+<th>切出的新样本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2</td>
+<td>(0,0,3)</td>
+<td>30,31,40,41,80,81</td>
+<td>30,31,40,41,80,81</td>
+</tr>
+<tr>
+<td>2</td>
+<td>(1,3,6)</td>
+<td>10,11,50,51,60,61,100,101,150,151</td>
+<td>60,61,100,101,150,151</td>
+</tr>
+<tr>
+<td>2</td>
+<td>(4,6,8)</td>
+<td>50,51,140,141,160,161,170,171</td>
+<td>160,161,170,171</td>
+</tr>
+<tr>
+<td>1</td>
+<td>(2,3,6)</td>
+<td>40,41,50,51,100,101,150,151</td>
+<td><strong>50,51</strong>,100,101,150,151</td>
+</tr>
+<tr>
+<td>1</td>
+<td>(5,6,8)</td>
+<td>90,91,110,111,170,171</td>
+<td><strong>110,111</strong>,170,171</td>
+</tr>
+</tbody>
+</table></div>
+<p>整段解码：<code>30,31,40,41,80,81,60,61,100,101,150,151,160,161,170,171</code>。left_ctx=2 时完全一致；left_ctx=1 时每个窗口第一帧（加粗）出现接缝：帧 3 本该看到 codes[1..3] = 1+4+1 = 6，却只看到 codes[2..3] = 4+1 = 5。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>做成 ramp [1,2,4,8,16,25] 时 TTFP/RTF 如何变化？</li>
+<li>为什么无状态解码让 code2wav 可以自由 batch？（对比 M06）</li>
+</ul>
+<p>对照源码：<code>model_executor/stage_input_processors/qwen3_omni.py:765-842</code> · <code>model_executor/models/qwen3_omni/qwen3_omni_code2wav.py:447-508</code></p>
+<nav class="pager"><a class="prev" href="p15_overview.html"><small>← 上一题</small>#22 · P15 Thinker→Talker 输入构造（含“差一行”）</a><a class="next" href="p18_overview.html"><small>下一题 →</small>#24 · P18 MRoPE 三维位置</a></nav>
+</main>
+</body>
+</html>

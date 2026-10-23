@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M08 提示 · 串起来：tiny thinker 的 KV-cache greedy 解码</title>
+<meta name="description" content="把 M01/M02/M03/M07 拼成一个只做文本的 thinker：prefill 一次、之后每步只算 1 个 token，生成的序列要和 HF 每步全量重算的 greedy 完全一致。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="m07_overview.html">← <span class="lbl">M07</span></a><a href="p02_overview.html"><span class="lbl">P02</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#8 · Track M · Qwen-Omni 模型实现 · 书 p.44</div>
+<h1>M08 · 串起来：tiny thinker 的 KV-cache greedy 解码</h1>
+<p class="lede">把 M01/M02/M03/M07 拼成一个只做文本的 thinker：prefill 一次、之后每步只算 1 个 token，生成的序列要和 HF 每步全量重算的 greedy 完全一致。</p>
+<div class="badges">
+<span class="badge">⏱ <b>60 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/m08_tiny_thinker_e2e.py</code></span>
+<span class="badge">验收 <code>./check.sh m08</code></span>
+<span class="badge">提示 <b>A-8</b> · 参考解 <b>C-8</b> <code>solutions/m08_tiny_thinker_e2e.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="M08">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：greedy(prompt=[10, 20, 30, 40], max_new=4)</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：这就是 stage 0 的 model runner 每一步做的事（去掉了多模态和 paged KV）。做完它，你就有了一个能接到 Track B scheduler、能被 Track A orchestrator 调度的“真模型”。</li>
+<li><strong>结构</strong>：</li>
+</ul>
+<pre><code>h = embed_tokens[ids]                                          # [T, hidden]
+for layer:  h = h + Attn(rms(h, ln1), cos, sin, cache)          # M02（cache 每层一个）
+            h = h + MoE(rms(h, ln2))                            # M03
+logits = rms(h, norm) @ lm_head^T                               # [T, vocab]
+</code></pre>
+<ul>
+<li><strong>位置</strong>：纯文本时三轴相同，<code>positions = arange(start, start+T).expand(3, T)</code>，用 M01 的 interleaved MRoPE。greedy：prompt 一次 forward（start=0），之后每步只喂上一个 token，<code>start = len(prompt) + 已生成数 − 1</code>。</li>
+<li><strong>依赖</strong>：直接 import 你自己写的 M01/M02/M03/M07——任何前置题的小 bug 都会以“第 k 个 token 开始不一样”的形式暴露。lm_head = <code>state[&quot;thinker.lm_head.weight&quot;]</code>。</li>
+</ul>
+<p><strong>验收要点</strong>：prefill logits 与 HF 一致 · KV-cache greedy 12 个 token 与 HF 全量重算 greedy 完全一致（两组随机权重）。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">新盖的房子要编门牌号</div><p>KV cache 是一条街：已经盖好的房子（缓存的 token）门牌 0, 1, …, L-1，每栋的 K 在入住时就按自己的门牌“旋转”好了。新房子的门牌必须是 <strong>L——街上已有房子的数目</strong>。如果编成 L+1，它和每个邻居的距离都多算 1：不报错、看起来差不多，但邻里关系悄悄变了——往往几步之后才“走错路”。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">接龙游戏</div><p>prefill = 先把题目整段读完，顺手说出第一个接龙词。之后每轮只听最新的一个词（只喂 <code>out[-1:]</code>），前面的内容都记在笔记本（cache）上。说 max_new 个词只需要 max_new 轮：第一轮的词来自读题，最后一个词说出口之后不必再听一轮。每轮开始时确认：笔记本上记了几个词（<code>len(cache)</code>），这一轮的新词就排第几（<code>start</code>）。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>张量</th>
+<th>形状（prefill / decode）</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>位置</td>
+<td>positions</td>
+<td><code>[3, 5]</code> / <code>[3, 1]</code></td>
+<td>三行都是 start … start+T-1；此时 interleaved MRoPE 与 1D RoPE 相同（实测 allclose），但仍走 M01 的接口</td>
+</tr>
+<tr>
+<td></td>
+<td>cos, sin</td>
+<td><code>[5, 16]</code> / <code>[1, 16]</code></td>
+<td>只覆盖新 token；所有层共享</td>
+</tr>
+<tr>
+<td>embed</td>
+<td><code>h = embed[ids]</code></td>
+<td><code>[5, 64]</code> / <code>[1, 64]</code></td>
+<td>查表</td>
+</tr>
+<tr>
+<td>每层</td>
+<td><code>h + attn(rms(h, ln1), cos, sin, cache)</code></td>
+<td><code>[T, 64]</code></td>
+<td>pre-norm 残差；cache 就地追加 T 个：0→5 / 5→6</td>
+</tr>
+<tr>
+<td></td>
+<td><code>h + moe(rms(h, ln2))</code></td>
+<td><code>[T, 64]</code></td>
+<td>top-2 of 6 experts</td>
+</tr>
+<tr>
+<td>输出</td>
+<td><code>rms(h, norm) @ lm_head.T</code></td>
+<td><code>[5, 97]</code> / <code>[1, 97]</code></td>
+<td>lm_head <code>[97, 64]</code> 来自 <code>state[&quot;thinker.lm_head.weight&quot;]</code>，不在 <code>thinker.model.</code> 下</td>
+</tr>
+<tr>
+<td>采样</td>
+<td><code>int(logits[-1].argmax())</code></td>
+<td>标量</td>
+<td>只用最后一行</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>decode 时 start 多加 1（<code>len(prompt)+len(out)</code>）→ 若干步后才分叉（实测第 5 个 token 起不同）。</li>
+<li>每步都把完整序列从 start=0 喂进同一组 caches → cache 重复增长，很快乱码（3 步后 cache 长度已是 15）。</li>
+<li>把 rms 的结果当残差主干（<code>h = rms(h) + attn(...)</code>）→ prefill logits 立刻不对。</li>
+<li>w13 两半切反 → MoE 输出全错；用 <code>chunk(2, dim=0)</code> 切 w13 是沿 expert 维切。</li>
+<li>忘了最终 norm → logits 量级明显偏大。</li>
+<li>caches 放在 <code>__init__</code>（第二次 greedy 继承历史）或放在 forward 里（等于没有 cache）。</li>
+</ul>
+<h2 id="s5">逐步图：greedy(prompt=[10, 20, 30, 40], max_new=4)</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 每次 forward 的参数</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 第 1 次 forward（prefill）</div><p>ids = <code>[10, 20, 30, 40]</code>，start = 0，positions = <code>[[0,1,2,3]]×3</code>，返回 logits <code>[4, V]</code>。</p>
+<p>forward 后每层 cache 长度 = 4；<code>out[0] = argmax(logits[-1])</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">2. 第 2 次 forward</div><p>ids = <code>[out[0]]</code>，start = <strong>4</strong>，positions = <code>[[4]]×3</code>，logits <code>[1, V]</code>；cache 4 → 5；得 out[1]。</p>
+<p>规律：<code>start = len(prompt) + len(out) − 1</code>，并且每次 forward 前 <code>start == len(cache)</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">3. 第 3、4 次 forward</div><p>start = 5 → cache 6 → out[2]；start = 6 → cache 7 → out[3]。</p>
+<p>max_new=4 只需要 4 次 forward：prefill 本身就产生了第一个 token，最后一个 token 不需要再 forward。</p>
+</div><div class="step" data-hl=""><div class="step-title">4. 真实数字（vocab=97, hidden=64, 2 层, H=4, KVH=2, D=16, 6 expert top-2）</div><pre><code>forward(tensor(prompt), 0, caches) -&gt; logits [4, 97]，argmax = 34，caches 长度 [4, 4]
+forward(tensor([34]), 4, caches)   -&gt; logits [1, 97]，argmax = 75，caches 长度 [5, 5]
+greedy(prompt, 6)                  -&gt; [34, 75, 75, 75, 17, 1]
+HF 每步全量重算的 greedy            -&gt; [34, 75, 75, 75, 17, 1]   ✓
+</code></pre>
+</div><div class="step" data-hl=""><div class="step-title">5. 两种 bug 的样子</div><pre><code>decode 时 start 多加 1           -&gt; [34, 75, 75, 75, 75, 75]   # 第 5 个 token 开始不同
+每步把完整序列从 start=0 喂进同一组 caches -&gt; [34, 77, 2]，3 步后 cache 长度已是 15
+</code></pre>
+<p>位置错误往往不会立刻改变 argmax，而是在若干步后才“分叉”——所以要比较整段序列。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>见逐步图的表格与真实数字。另一个例子：纯文本 MRoPE 等于普通 1D RoPE：</p>
+<pre><code>positions = arange(4, 6).expand(3, 2) -&gt; [[4, 5], [4, 5], [4, 5]]
+cos, sin = mrope_cos_sin(rope_inv_freq(16, 10000.0), positions, [4, 2, 2], interleaved=True)
+cos.shape -&gt; [2, 16]，与“只用 t 轴位置 [4, 5] 的普通 RoPE”的 cos 完全相同
+</code></pre>
+<h4>关键问题</h4>
+<ol>
+<li>PackedLayer 只有打包后的 qkv 和 w13，M02 要分开的 q/k/v、M03 要分开的 w_gate/w_up，分别按什么尺寸切？</li>
+<li><code>forward(ids, start, caches)</code> 中 positions 形状是什么？三条轴填什么？</li>
+<li>cos/sin 每次 forward 都要重算吗？对应“新 token”的位置还是“cache 中全部 token”的位置？</li>
+<li>M02 自己根据 len(cache) 决定因果 mask；start 和 len(cache) 应满足什么关系？不满足会怎样？</li>
+<li>lm_head 来自哪个 key？为什么不经过 load_thinker_text？logits 是 <code>h @ lm_head</code> 还是 <code>h @ lm_head.T</code>？</li>
+<li>greedy 一共调用多少次 forward？第 k 次 decode 喂哪个 token、start 是多少？</li>
+<li>caches 应该在 <code>__init__</code>、greedy 开头，还是每次 forward 里创建？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>Dims 给出切分与 RoPE 所需全部超参；eps 同时用于所有 RMSNorm（包括 q_norm/k_norm）。</li>
+<li>pre-norm：归一化只作用在子层输入上，残差加的是未归一化的 h；最后一层之后再 <code>rms(h, norm)</code> 才乘 lm_head。</li>
+<li>One KVCache per layer：caches 长度 num_layers，第 l 层只读写 <code>caches[l]</code>；M02 就地追加 K/V。</li>
+<li>“Must equal HF full-recompute greedy”：数值有极小浮点差异，但 argmax 序列必须完全一致。</li>
+<li>forward 返回 <code>[T, V]</code> 全部行（测试会比较 prefill 的全部行）；greedy 只用 <code>logits[-1]</code>。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong><code>__init__</code></strong>：(1) <code>load_thinker_text(state, dims.num_layers)</code>；(2) 取 <code>state[&quot;thinker.lm_head.weight&quot;]</code>；(3) 每个 PackedLayer 转成 AttnWeights + MoeWeights（连同 ln1/ln2）；(4) 预先算 <code>inv_freq = rope_inv_freq(head_dim, rope_theta)</code>。</li>
+<li><strong>权重还原</strong>：<code>q, k, v = L.qkv.split([H*D, KVH*D, KVH*D], dim=0)</code>；<code>I = L.w13.shape[1] // 2</code>，<code>w_gate = L.w13[:, :I]</code>、<code>w_up = L.w13[:, I:]</code>、<code>w_down = L.w2</code>。</li>
+<li><strong>forward</strong>：positions → cos/sin（一次，所有层共享）→ <code>h = embed[ids]</code> → 逐层残差 → 最终 norm → <code>@ lm_head.T</code>。</li>
+<li><strong>与 M02 的契约</strong>：M02 把新 token 放在 len(cache) .. len(cache)+T-1 做 mask，RoPE 位置由你的 cos/sin 决定——二者必须一致：<code>start == len(caches[0])</code>，可加 assert。</li>
+<li><strong>greedy</strong>：caches 在开头新建；prefill 得第一个 token；<code>while len(out) &lt; max_new</code> 只喂 <code>out[-1:]</code>，<code>start = len(prompt) + len(out) - 1</code>。</li>
+<li><strong>调试顺序</strong>：先看 prefill logits 是否 allclose（检查权重、norm、MoE、RoPE）；再看 greedy 序列（检查 cache 与 start）。前者错多半是前置题的问题。</li>
+<li><code>@torch.no_grad()</code>；<code>torch.tensor(prompt)</code> 是 long；token 用 <code>int(...)</code> 放进 list。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>qkv 按行 split 为 <code>[H·D, KVH·D, KVH·D]</code>；w13 在 dim 1 对半：前 I 行 gate、后 I 行 up。</li>
+<li><code>[3, T]</code> long，三行都是 <code>arange(start, start+T)</code>。</li>
+<li>每次 forward 重算，只对应新 token；cache 中旧 token 的 K 写入前已用自己的位置旋转过。</li>
+<li>必须 <code>start == len(cache)</code>；否则 RoPE 相对距离和 mask 认为的位置不一致，输出悄悄偏离，常在若干步后分叉。</li>
+<li><code>state[&quot;thinker.lm_head.weight&quot;]</code>，形状 <code>[V, hidden]</code>；不在 <code>thinker.model.</code> 下；<code>logits = h @ lm_head.T</code>。</li>
+<li>共 max_new 次：1 次 prefill + (max_new − 1) 次 decode。第 k 次 decode（k 从 1 开始）喂 <code>out[k-1]</code>，start = len(prompt) + k − 1。</li>
+<li>greedy 开头、每层一个；放 <code>__init__</code> 会继承上一次历史，放 forward 里等于没有 cache。</li>
+</ol>
+</div></details>
+<p><strong>形状追踪</strong>（hidden=64, H=4, KVH=2, D=16, V=97, prompt 长 4）：</p>
+<pre><code>prefill: ids [4] -&gt; positions [3, 4] -&gt; cos/sin [4, 16]
+         h = embed[ids]                      [4, 64]
+         rms(h, ln1) -&gt; attention_forward    [4, 64]    cache: 0 -&gt; 4
+         rms(h, ln2) -&gt; moe_forward          [4, 64]
+         (第 2 层同理)
+         rms(h, norm) @ lm_head.T            [4, 97]
+decode:  ids [1], start=4 -&gt; positions [3, 1] -&gt; cos/sin [1, 16]
+         ...                                 [1, 97]    cache: 4 -&gt; 5
+</code></pre>
+<p><strong>自检</strong>：循环里 <code>assert start == len(caches[0])</code>；再写一个“每步全量重算”的慢版本（每次新建 caches，从 start=0 喂 prompt+out），两者 token 序列必须完全相同。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>把 KVCache 换成 P06 BlockManager + P09 paged attention。</li>
+<li>加上 M04 的多模态合并，位置改用 P18 的 MRoPE 位置。</li>
+</ul>
+<p>对照源码：<code>model_executor/models/qwen3_omni/qwen3_omni.py:235-267</code> · HF <code>Qwen3OmniMoeThinkerTextModel</code></p>
+<nav class="pager"><a class="prev" href="m07_overview.html"><small>← 上一题</small>#7 · M07 按 stage 加载与打包权重</a><a class="next" href="p02_overview.html"><small>下一题 →</small>#9 · P02 Orchestrator v1：线性多 stage 路由</a></nav>
+</main>
+</body>
+</html>

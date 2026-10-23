@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nano-vllm-omni 刷题提示</title>
+<meta name="description" content="26 道 nano-vllm-omni 核心实现题的三级提示、逐步图与易错点总览">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">《nano-vllm-omni 自学手册》Part I · 交互提示</div>
+<h1>26 道一小时核心实现 · 提示总览</h1>
+<p class="lede">每题一页：题面速览、直觉类比、shape trace、易错点、可逐步播放的交互图，以及按剧透程度递增的 L1 → L2 → L3 三级提示（卡住 15 分钟以上再看）。</p>
+<div class="badges"><span class="badge">共 <b>26</b> 题</span><span class="badge">约 <b>22 小时 35 分</b></span>
+<span class="badge">P02 额外：<a href="p02_flow.html">时序图</a> · <a href="p02_vs_vllm_omni.html">源码对照</a></span></div>
+<div class="progress" title="完成进度"><div id="prog-bar"></div></div>
+<p class="small muted"><span id="prog-text"></span> · 进度只存在本浏览器的 localStorage 里 ·
+<button type="button" class="btn" id="prog-reset">清空</button></p>
+</section><h2 id="s1">怎么用这些提示</h2>
+<ol>
+<li><strong>先读题 5 分钟</strong>（PDF 对应页），列出你想到的边界情况；然后在 <code>mine/&lt;文件&gt;.py</code> 里限时 45 分钟实现；最后 15 分钟用 <code>./check.sh &lt;id&gt;</code> 跑测试、修 bug。</li>
+<li>卡住 15 分钟以上，再打开对应题的提示页，<strong>按级别逐级展开</strong>：</li>
+</ol>
+<div class="legend">
+<span><span class="lvl" style="background:var(--l1);color:#fff">L1</span> I/O 示例 + 关键问题 + 细节：只告诉你“应该得到什么”</span>
+<span><span class="lvl" style="background:var(--l2);color:#fff">L2</span> 思路拆分与常见坑：告诉你“怎么拆、哪里会错”</span>
+<span><span class="lvl" style="background:var(--l3);color:#fff">L3</span> 详解：关键问题答案、逐步状态追踪、骨架要点</span>
+</div>
+<ol start="3">
+<li>每页的 <strong>▶ 逐步图</strong> 可以用“下一步”按钮（或聚焦后按 ← →）一步一步看状态如何变化；<strong>虚线框里的“显示答案”</strong> 是题面里留给你填的 <code>??</code>。</li>
+<li>做完一题，勾选页面顶部的“标记完成”，这里的进度条会同步（只存在本浏览器里）。</li>
+<li>带完整中文注释的参考解在 <code>solutions/</code>（易错点用 <code>易错：</code> 标出），做完再看：<code>./check.sh m01 --solutions</code>。</li>
+</ol>
+
+<div class="callout info"><div class="callout-title">推荐顺序与依赖</div><p>Track <strong>M → A → B → C → D → E</strong>。题目之间的依赖：<strong>M08</strong> 会 import 你写的 M01、M02、M03、M07；<strong>P03</strong> 继承你写的 P02；其余各题互相独立。
+全部在 CPU 上跑；Track M 的测试拿 HF transformers 4.57.1 的 Qwen3-Omni 作为对拍标准答案。</p>
+</div>
+<h2 id="s2">并发程序设计框架：T · SBWC · LIFE</h2>
+<p>写 asyncio / 多线程并发程序时按顺序走的思考清单（Track A/B/C/E 的提示页都会用它来分析题目）。<strong>先定场地 T，再搭骨架 SBWC，再让它活起来 LIFE。</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>问自己</th>
+<th>规则</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>T</strong> Topology 执行拓扑</td>
+<td>代码跑在哪些进程 / 线程 / 事件循环里？边界在哪？</td>
+<td>每跨一层边界，能用的通信方式和同步原语都不一样；先定 T</td>
+</tr>
+<tr>
+<td><strong>S</strong> State 账本</td>
+<td>哪些可变共享状态？每一份由谁写？</td>
+<td>尽量单写者（single writer），做不到才上锁</td>
+</tr>
+<tr>
+<td><strong>B</strong> Blocking 阻塞点</td>
+<td>程序会在哪里“干等”？哪些互相独立？</td>
+<td>每个独立阻塞源配一个专门守着它的 worker</td>
+</tr>
+<tr>
+<td><strong>W</strong> Workers 岗位</td>
+<td>每个 worker 等什么、做什么、<strong>不准做什么</strong>？</td>
+<td>职责越单一越好：搬运工只搬运，决策者只决策</td>
+</tr>
+<tr>
+<td><strong>C</strong> Channels 通道</td>
+<td>岗位之间用什么传消息？消息格式？</td>
+<td>多生产者一消费者 → fan-in 到一个队列，消息带来源标识</td>
+</tr>
+<tr>
+<td><strong>L</strong> Lifecycle 生命周期</td>
+<td>怎么启动？怎么干净地停？</td>
+<td><code>create_task</code> 保存句柄；停时 <code>cancel()</code> + <code>gather(return_exceptions=True)</code></td>
+</tr>
+<tr>
+<td><strong>I</strong> Interface 对外接口</td>
+<td>公开 API 只做什么？跑在谁的上下文？</td>
+<td>接口要薄：只往通道 put / 从通道 get</td>
+</tr>
+<tr>
+<td><strong>F</strong> Flow + Invariants</td>
+<td>必须永远成立的规则是什么？</td>
+<td><code>await</code> = 交出控制权；await 之前状态必须自洽</td>
+</tr>
+<tr>
+<td><strong>E</strong> Edges + Errors</td>
+<td>迟到 / 乱序 / 重复 / 未知 / 异常怎么办？</td>
+<td>worker 不能因一条坏消息退出；“不该发生但可能发生”的要有明确处理并计数</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>跨越边界用什么：</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>边界</th>
+<th>通信方式</th>
+<th>同步原语</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>进程 ↔ 进程</td>
+<td>pipe / zmq / 共享内存（<code>multiprocessing.shared_memory</code>）</td>
+<td>文件锁、协议约定（谁创建、谁释放）</td>
+</tr>
+<tr>
+<td>线程 ↔ 线程</td>
+<td><code>queue.Queue</code>、<code>collections.deque</code> + 锁</td>
+<td><code>threading.Lock / Event / Condition</code></td>
+</tr>
+<tr>
+<td>线程 → 事件循环</td>
+<td><code>loop.call_soon_threadsafe(...)</code>、<code>asyncio.run_coroutine_threadsafe(...)</code></td>
+<td>只能通过这两座“桥”进入循环</td>
+</tr>
+<tr>
+<td>task ↔ task（同一循环）</td>
+<td><code>asyncio.Queue</code></td>
+<td><code>asyncio.Event</code>，或干脆单写者不加锁</td>
+</tr>
+</tbody>
+</table></div>
+
+<div class="callout ok"><div class="callout-title">三条贯穿始终的法则</div><ol>
+<li><strong>await 就是交出控制权。</strong> 看到 <code>await</code> 就问：“如果此刻别的 worker 来跑，它看到的状态对吗？”状态修改要在 await 之前完成。</li>
+<li><strong>跨线程只能用专门的桥。</strong> 从普通线程进入 asyncio 用 <code>loop.call_soon_threadsafe</code>，不要在线程里直接调 <code>asyncio.Queue</code> / <code>Event</code> 的方法（P01 练的就是这个）。</li>
+<li><strong>能用“队列 + 单写者”，就别用锁。</strong> 队列把并发问题变成串行处理，“谁在什么时候改了什么”一目了然。</li>
+</ol>
+</div>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>常见模式</th>
+<th>什么时候用</th>
+<th>本套题里</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fan-in（多读者 → 一个队列 → 单消费者）</td>
+<td>多个独立阻塞源，结果要一处统一处理</td>
+<td>P02 / P03 的 readers + dispatcher</td>
+</tr>
+<tr>
+<td>single writer</td>
+<td>共享状态需要复杂的读-改-写</td>
+<td>P02 dispatcher、P10 EngineCore loop</td>
+</tr>
+<tr>
+<td>线程 → 事件循环的桥（批量唤醒）</td>
+<td>生产者在线程、消费者在 asyncio</td>
+<td>P01 OutputSink</td>
+</tr>
+<tr>
+<td>请求关联（key → future）</td>
+<td>共享通道上的 RPC，结果乱序返回</td>
+<td>P05 RpcRouter</td>
+</tr>
+<tr>
+<td>后台收发线程 + 顺序号</td>
+<td>跨进程数据要按顺序、可取消地传递</td>
+<td>P13 ChunkAdapter</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s3">26 题</h2>
+
+<div class="callout analogy"><div class="callout-title">Capstone（做完 26 题之后）</div><p>用你自己的实现在 CPU 上拼一个 3 stage 的 mini omni 服务：三个 spawn 子进程各跑 P10 busy loop（内部 P07 scheduler，可选 P06）；父进程 orchestrator 线程用 P03 编排、结果经 P01 交给前端、abort 用 P04、RPC 用 P05；stage 之间用 P12 + P13 传数据，接收端用 P11 停靠、codec 切窗用 P14，启动用 P16。验收：100 个并发请求、随机 10% abort、随机 kill 一次 stage2 —— 每个请求恰好一个终态、<code>/dev/shm</code> 无残留、没有僵尸进程。</p>
+</div><div class="track-head"><h2 id="track-M">Track M · Qwen-Omni 模型实现</h2><span class="muted">8 题 · 435 分钟</span></div><p class="muted">先把模型本身吃透：每题对拍 HF transformers 4.57 的 Qwen3-Omni（tiny 随机权重，CPU 秒级）。</p><div class="grid"><a class="card" href="m01_overview.html" data-id="M01" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#1</span><span class="id">M01</span><div class="ttl">RMSNorm 与多模态 RoPE（interleaved / chunked）</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.19<br><code>m01_rmsnorm_mrope</code></div></a><a class="card" href="m02_overview.html" data-id="M02" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#2</span><span class="id">M02</span><div class="ttl">Thinker Attention：QK-norm + GQA + KV cache</div><div class="meta">⏱ 60 min · 难度 中 · 书 p.23<br><code>m02_thinker_attention</code></div></a><a class="card" href="m03_overview.html" data-id="M03" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#3</span><span class="id">M03</span><div class="ttl">Sparse MoE：路由、按 expert 分组计算、shared expert</div><div class="meta">⏱ 60 min · 难度 中 · 书 p.27<br><code>m03_sparse_moe</code></div></a><a class="card" href="m04_overview.html" data-id="M04" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#4</span><span class="id">M04</span><div class="ttl">多模态拼接：placeholder 计数、embedding 合并、DeepStack</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.31<br><code>m04_mm_merge_deepstack</code></div></a><a class="card" href="m05_overview.html" data-id="M05" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#5</span><span class="id">M05</span><div class="ttl">Talker MTP：一帧内预测 15 个残差 codebook</div><div class="meta">⏱ 60 min · 难度 难 · 书 p.35<br><code>m05_talker_mtp</code></div></a><a class="card" href="m06_overview.html" data-id="M06" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#6</span><span class="id">M06</span><div class="ttl">Code2Wav 的流式因果卷积与转置卷积</div><div class="meta">⏱ 60 min · 难度 难 · 书 p.38<br><code>m06_streaming_causal_conv</code></div></a><a class="card" href="m07_overview.html" data-id="M07" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#7</span><span class="id">M07</span><div class="ttl">按 stage 加载与打包权重</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.41<br><code>m07_stage_weight_loading</code></div></a><a class="card" href="m08_overview.html" data-id="M08" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#8</span><span class="id">M08</span><div class="ttl">串起来：tiny thinker 的 KV-cache greedy 解码</div><div class="meta">⏱ 60 min · 难度 中 · 书 p.44<br><code>m08_tiny_thinker_e2e</code></div></a></div><div class="track-head"><h2 id="track-A">Track A · 前端与 Orchestrator</h2><span class="muted">5 题 · 250 分钟</span></div><p class="muted">API 进程里的并发：线程 ↔ 事件循环、单写者路由、终态、abort、RPC。</p><div class="grid"><a class="card" href="p02_overview.html" data-id="P02" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#9</span><span class="id">P02</span><div class="ttl">Orchestrator v1：线性多 stage 路由</div><div class="meta">⏱ 60 min · 难度 中 · 书 p.48<br><code>p02_orchestrator</code></div></a><a class="card" href="p03_overview.html" data-id="P03" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#10</span><span class="id">P03</span><div class="ttl">Orchestrator v2：async_chunk 预热 + 终态守门</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.51<br><code>p03_async_chunk_orchestrator</code></div></a><a class="card" href="p01_overview.html" data-id="P01" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#11</span><span class="id">P01</span><div class="ttl">OutputSink：线程 → asyncio 的批量唤醒</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.54<br><code>p01_output_sink</code></div></a><a class="card" href="p04_overview.html" data-id="P04" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#12</span><span class="id">P04</span><div class="ttl">StagePool：粘性绑定、两阶段 abort、故障隔离</div><div class="meta">⏱ 60 min · 难度 中 · 书 p.57<br><code>p04_stage_pool_abort</code></div></a><a class="card" href="p05_overview.html" data-id="P05" data-min="40"><input type="checkbox" class="chk" title="标记完成"><span class="num">#13</span><span class="id">P05</span><div class="ttl">RpcRouter：共享通道上的 RPC 关联</div><div class="meta">⏱ 40 min · 难度 易 · 书 p.61<br><code>p05_rpc_router</code></div></a></div><div class="track-head"><h2 id="track-B">Track B · Stage 进程与调度</h2><span class="muted">6 题 · 330 分钟</span></div><p class="muted">EngineCore busy loop、停靠/归还、continuous batching、paged KV、采样、attention。</p><div class="grid"><a class="card" href="p10_overview.html" data-id="P10" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#14</span><span class="id">P10</span><div class="ttl">EngineCore busy loop</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.65<br><code>p10_engine_core_loop</code></div></a><a class="card" href="p11_overview.html" data-id="P11" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#15</span><span class="id">P11</span><div class="ttl">WAITING_FOR_CHUNK：停靠与归还</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.68<br><code>p11_chunk_aware_scheduler</code></div></a><a class="card" href="p07_overview.html" data-id="P07" data-min="75"><input type="checkbox" class="chk" title="标记完成"><span class="num">#16</span><span class="id">P07</span><div class="ttl">Scheduler：continuous batching + chunked prefill + 抢占</div><div class="meta">⏱ 75 min · 难度 难 · 书 p.72<br><code>p07_scheduler</code></div></a><a class="card" href="p06_overview.html" data-id="P06" data-min="75"><input type="checkbox" class="chk" title="标记完成"><span class="num">#17</span><span class="id">P06</span><div class="ttl">BlockManager：paged KV + 前缀缓存</div><div class="meta">⏱ 75 min · 难度 难 · 书 p.76<br><code>p06_block_manager</code></div></a><a class="card" href="p08_overview.html" data-id="P08" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#18</span><span class="id">P08</span><div class="ttl">批不变的采样器（per-request seed）</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.80<br><code>p08_sampler</code></div></a><a class="card" href="p09_overview.html" data-id="P09" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#19</span><span class="id">P09</span><div class="ttl">Paged KV 写入 + decode attention（参考实现）</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.84<br><code>p09_paged_attention</code></div></a></div><div class="track-head"><h2 id="track-C">Track C · 数据面</h2><span class="muted">2 题 · 135 分钟</span></div><p class="muted">跨进程 payload：共享内存协议、后台收发线程、顺序与清理。</p><div class="grid"><a class="card" href="p12_overview.html" data-id="P12" data-min="60"><input type="checkbox" class="chk" title="标记完成"><span class="num">#20</span><span class="id">P12</span><div class="ttl">SharedMemoryConnector：跨进程 put/get 协议</div><div class="meta">⏱ 60 min · 难度 难 · 书 p.88<br><code>p12_shm_connector</code></div></a><a class="card" href="p13_overview.html" data-id="P13" data-min="75"><input type="checkbox" class="chk" title="标记完成"><span class="num">#21</span><span class="id">P13</span><div class="ttl">ChunkAdapter：后台收发线程与顺序/清理语义</div><div class="meta">⏱ 75 min · 难度 难 · 书 p.91<br><code>p13_chunk_adapter</code></div></a></div><div class="track-head"><h2 id="track-D">Track D · 模型胶水（纯函数）</h2><span class="muted">3 题 · 120 分钟</span></div><p class="muted">最容易“差一行”的地方：thinker→talker 输入、codec 窗口、MRoPE 位置。</p><div class="grid"><a class="card" href="p15_overview.html" data-id="P15" data-min="40"><input type="checkbox" class="chk" title="标记完成"><span class="num">#22</span><span class="id">P15</span><div class="ttl">Thinker→Talker 输入构造（含“差一行”）</div><div class="meta">⏱ 40 min · 难度 易 · 书 p.96<br><code>p15_talker_inputs</code></div></a><a class="card" href="p14_overview.html" data-id="P14" data-min="40"><input type="checkbox" class="chk" title="标记完成"><span class="num">#23</span><span class="id">P14</span><div class="ttl">Codec 窗口规划：首块小、后块大、左上下文</div><div class="meta">⏱ 40 min · 难度 易 · 书 p.99<br><code>p14_codec_windows</code></div></a><a class="card" href="p18_overview.html" data-id="P18" data-min="40"><input type="checkbox" class="chk" title="标记完成"><span class="num">#24</span><span class="id">P18</span><div class="ttl">MRoPE 三维位置</div><div class="meta">⏱ 40 min · 难度 中 · 书 p.102<br><code>p18_mrope_positions</code></div></a></div><div class="track-head"><h2 id="track-E">Track E · 启动与 GPU</h2><span class="muted">2 题 · 85 分钟</span></div><p class="muted">多 stage 共卡启动、显存准入、CUDA graph bucket。</p><div class="grid"><a class="card" href="p16_overview.html" data-id="P16" data-min="45"><input type="checkbox" class="chk" title="标记完成"><span class="num">#25</span><span class="id">P16</span><div class="ttl">启动规划：设备分组、并行初始化、回滚、准入</div><div class="meta">⏱ 45 min · 难度 中 · 书 p.106<br><code>p16_init_planner</code></div></a><a class="card" href="p17_overview.html" data-id="P17" data-min="40"><input type="checkbox" class="chk" title="标记完成"><span class="num">#26</span><span class="id">P17</span><div class="ttl">CUDA graph bucket runner（CPU 模拟）</div><div class="meta">⏱ 40 min · 难度 易 · 书 p.109<br><code>p17_graph_runner</code></div></a></div>
+</main>
+</body>
+</html>

@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P16 提示 · 启动规划：设备分组、并行初始化、回滚、准入</title>
+<meta name="description" content="thinker 独占 GPU0、talker 和 code2wav 共享 GPU1：后两者必须串行初始化（显存测量会互相干扰），但两组之间可以并行；任何一个失败都要把已起来的全部回收。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p18_overview.html">← <span class="lbl">P18</span></a><a href="p17_overview.html"><span class="lbl">P17</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#25 · Track E · 启动与 GPU · 书 p.106</div>
+<h1>P16 · 启动规划：设备分组、并行初始化、回滚、准入</h1>
+<p class="lede">thinker 独占 GPU0、talker 和 code2wav 共享 GPU1：后两者必须串行初始化（显存测量会互相干扰），但两组之间可以并行；任何一个失败都要把已起来的全部回收。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p16_init_planner.py</code></span>
+<span class="badge">验收 <code>./check.sh p16</code></span>
+<span class="badge">提示 <b>A-25</b> · 参考解 <b>C-25</b> <code>solutions/p16_init_planner.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P16">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC · LIFE</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：并查集推导（例 1 第一组）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：每个 stage 启动时会：加载权重 → 跑一次最大 batch 的 profile → 用“显存预算 − 已用”算出 KV block 数 → capture CUDA graph。第 2、3 步依赖测量当前空闲显存：同卡上另一个 stage 恰好在加载权重时测量就是错的——KV 算多了会 OOM，算少了浪费。</li>
+<li><strong>需求</strong>：
+<ul>
+<li><strong>分组</strong>：共享设备（含传递关系：{0,1} 和 {1,2} 也是一组）的 stage 属于同一组；组内按 stage id 串行，组间在线程池里并行。</li>
+<li><strong>失败短路</strong>：第一个失败后不再启动任何新的 init；正在进行的让它结束；然后对所有已成功的 stage 调用 cleanup；抛 <code>InitError(stage_id)</code>。</li>
+<li><strong>准入检查</strong>：启动前对每张卡检查 <code>Σ(util × total + reserve) ≤ total</code>，提前拒绝不可能成功的部署。</li>
+</ul>
+</li>
+</ul>
+<pre><code>默认 Qwen3-Omni（2×H100）：
+  GPU0: thinker(0.9)                →  组 [0]
+  GPU1: talker(0.6) code2wav(0.1)   →  组 [1, 2]（串行）      两组并行
+</code></pre>
+<p><strong>验收要点</strong>：设备重叠的连通分量 · 组间并行、组内串行且按 stage id · 失败短路 + 回滚已成功的 stage · 显存准入检查。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">拼车（设备分组 = 并查集）</div><p>每个 stage 是乘客，每张 GPU 是一辆车。坐同一辆车的人必须一起出发，车上一次只能有一个人“量座位”（组内串行）。关键在传递：A 和 B 都坐 2 号车，B 和 C 都坐 3 号车——A 和 C 没共用任何一辆车，但因为 B 同时占着 2、3 号车，三人只能编成一个车队。并查集就是“车队花名册”：每来一位乘客，看他要坐的车有没有人登记过；有就把两个车队合并。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">搬家公司撤场（失败回滚）</div><p>三个搬家小组同时往三栋楼搬家具。B 组摔坏了一件（init 失败），总调度喊停：① 还没开始搬的不准再开始；② 正在搬的那件不能半空中扔下，搬完再说；③ 等所有人都停手之后，再把已经搬进去的家具全部搬出来——如果在 B 摔坏的那一刻就开始清点，会漏掉 A 组手上那件“稍后才放下”的家具。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">餐厅订座（显存准入）</div><p>一张 80 座的桌子（一张卡），每桌客人（stage）按“桌子大小的百分比”订座，外加每桌固定几把备用椅（reserve）。开饭前先算一遍 Σ(比例 × 80 + 备用椅) ≤ 80？超了就当场告诉客人“坐不下”。跨两张桌子的大客户（TP=2）每张桌子都按它的比例各算一份。</p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC · LIFE</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>P16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>主线程调用 run_init；一个线程池，每个组一个任务（不是 asyncio：init_fn 是阻塞的同步调用）。真实系统里每个 stage 是独立进程，同卡测量的互斥靠跨进程文件锁</td>
+</tr>
+<tr>
+<td>S</td>
+<td>results（成功的 stage → handle）、failure（第一次失败，最多一条）。多个 worker 线程都会写 → 一把 threading.Lock</td>
+</tr>
+<tr>
+<td>B</td>
+<td><code>init_fn(sid)</code> 很慢——必须在锁外调用，否则组间并行退化成全局串行。主线程在“线程池退出”处等所有组结束</td>
+</tr>
+<tr>
+<td>W</td>
+<td>每个组一个 worker：按 stage id 顺序 for 循环；每次开始新 init 之前看一眼 failure。不准：组内并行、在失败瞬间做 cleanup</td>
+</tr>
+<tr>
+<td>C</td>
+<td>没有队列；worker 之间只通过锁保护的共享状态交流（一面“已出事”的旗子）</td>
+</tr>
+<tr>
+<td>L</td>
+<td>先 join 再回滚：线程池的 with 块退出 = 所有组都结束、results 不再变化，然后统一 cleanup、再 raise</td>
+</tr>
+<tr>
+<td>I</td>
+<td>成功返回完整 dict；失败只有一种出口：<code>InitError(第一个失败的 stage)</code>，原始异常挂在 <code>__cause__</code> 上</td>
+</tr>
+<tr>
+<td>F</td>
+<td>① 同组 stage 的 init 永不重叠且按 id 顺序；② 第一次失败之后不再开始新的 init；③ 返回/抛出时所有成功过的 stage 要么在结果里、要么已被 cleanup——恰好一次；④ 失败的 stage 不 cleanup</td>
+</tr>
+<tr>
+<td>E</td>
+<td>多个组几乎同时失败（只记第一条）；正在跑的 init 在失败之后才成功（也要回滚）；max_workers &lt; 组数（排队的组轮到时发现已失败直接返回）；KeyboardInterrupt 之类也要触发回滚；空卡不报错；need 恰好等于 total 允许</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>组内也并行（把每个 stage 单独 submit）→ 同卡 stage 并发初始化。</li>
+<li>失败后只检查“本组”是否失败，其他组还会继续启动新的 stage。</li>
+<li>把失败的 stage 也 cleanup（它没有 result）。</li>
+<li>只捕获 Exception——想想 init 里的 KeyboardInterrupt / SystemExit。</li>
+<li>异常留在 Future 里：<code>ex.map</code> / <code>future.result()</code> 在主线程重新抛出，丢失“哪个 stage”以及“先 cleanup 再 raise”的控制。</li>
+<li>失败瞬间就 cleanup：漏掉之后才完成的 stage。</li>
+<li>持锁调用 init_fn。</li>
+<li>只看两两关系不做传递闭包。</li>
+<li>admission 用 <code>≥</code> 报错（相等应允许），或对空卡输出错误。</li>
+</ul>
+<h2 id="s5">逐步图：并查集推导（例 1 第一组）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ {0: {2}, 1: {0}, 2: {0, 1}, 3: {1}, 4: {5}}，按 stage 升序遍历，owner[device] = 第一次占用者</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. stage 0，devices {2}</div><p>owner[2] = 0。parent：0→0 1→1 2→2 3→3 4→4</p>
+</div><div class="step" data-hl=""><div class="step-title">2. stage 1，devices {0}</div><p>owner[0] = 1。不变</p>
+</div><div class="step" data-hl=""><div class="step-title">3. stage 2，devices {0, 1}</div><p>dev0 已属 1 → union(2, 1)：让较小的当根 → 2→1；owner[1] = 2</p>
+</div><div class="step" data-hl=""><div class="step-title">4. stage 3，devices {1}</div><p>dev1 已属 2 → union(3, find(2)=1) → 3→1</p>
+</div><div class="step" data-hl=""><div class="step-title">5. stage 4，devices {5}</div><p>owner[5] = 4。不变</p>
+</div><div class="step" data-hl=""><div class="step-title">6. 按 root 收集</div><p>{0:[0], 1:[1,2,3], 4:[4]} → 按首元素排序 → <strong>[[0], [1, 2, 3], [4]]</strong></p>
+<p>union 时让较小的 id 当 root，root 恰好是组内最小值（非必须）。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1：init_groups（含传递）</strong></p>
+<pre><code>{0: {2}, 1: {0}, 2: {0, 1}, 3: {1}, 4: {5}}    → [[0], [1, 2, 3], [4]]
+{3: {7}, 1: {7}, 0: {9}, 2: {9, 4}}            → [[0, 2], [1, 3]]      # dict key 顺序是乱的
+{0: {0}, 1: {1}, 2: {2}, 3: {2, 0}}            → [[0, 2, 3], [1]]      # stage3 把 0 和 2 “桥接”起来
+</code></pre>
+<p><strong>例 2：run_init 失败短路</strong>（max_workers=1，让顺序确定）：</p>
+<pre><code>stage_devices = {0: {0}, 1: {0}, 2: {1}}     → groups [[0, 1], [2]]
+init_fn: stage1 抛 RuntimeError(&quot;boom&quot;)，其它返回 &quot;e&lt;sid&gt;&quot;
+组[0,1]: init(0) → &quot;e0&quot; ✓ ; init(1) → 抛异常，记为第一次失败
+组[2] : 开始前发现已有失败 → 不调用 init(2)
+结束后：cleanup_fn(0, &quot;e0&quot;)；raise InitError(stage_id=1)
+若改成 stage2 失败：调用 [0, 1, 2]，cleanup (0,&quot;e0&quot;),(1,&quot;e1&quot;)，InitError.stage_id = 2
+全部成功：init_fn = lambda s: s*10 → {0: 0, 1: 10, 2: 20}
+</code></pre>
+<p><strong>例 3：admission_check</strong>（GiB = 2³⁰，两张 80 GiB 卡）：</p>
+<pre><code>reserve = 2 GiB, {0: ({0}, 0.9), 1: ({1}, 0.6), 2: ({1}, 0.3)}
+  dev0: 72+2 = 74 ≤ 80 ✓    dev1: (48+2)+(24+2) = 76 ≤ 80 ✓        → []
+stage2 改成 0.35：dev1 = 50 + 30 = 80 ≤ 80 ✓（恰好相等也允许）     → []
+再把 reserve 改成 4 GiB：dev1 = 52 + 32 = 84 &gt; 80                    → 1 条，含 &quot;device 1&quot;
+跨卡 stage（TP=2），reserve = 3 GiB, {0: ({0, 1}, 0.5), 1: ({1}, 0.45)}
+  dev0: 40+3 = 43 ✓    dev1: (40+3)+(36+3) = 82 &gt; 80                  → 1 条，含 &quot;device 1&quot;
+再加一张没有任何 stage 的 dev2 → 不产生错误
+</code></pre>
+<h4>关键问题</h4>
+<ol>
+<li>“共享设备”为什么要按传递闭包分组？举一个只看两两关系会出错的例子。</li>
+<li>组内为什么必须串行？</li>
+<li>第一次失败发生时，另一个组里正在执行的 init_fn 怎么办？能不能强行中断线程？</li>
+<li>cleanup 应该在失败那一刻立即调用，还是等所有线程都结束后？</li>
+<li>多个组几乎同时失败，InitError 报哪一个？谁保证“第一个”只记录一次？</li>
+<li>一个 stage 放在 {0, 1} 两张卡上，utilization 按哪张卡的 total 算？算几次？</li>
+<li>比较用 &gt; 还是 ≥？没有任何 stage 的卡要不要输出？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>组的规范形式：每组升序；组之间按各自最小 stage 排序——与 dict 插入顺序、set 迭代顺序无关。</li>
+<li><code>cleanup_fn(stage, result)</code> 的第二个参数是该 stage 的 init_fn 返回值。</li>
+<li>推荐 <code>raise InitError(sid, cause) from cause</code> 保留原始 traceback。</li>
+<li>错误字符串每张超额的卡一条，必须包含子串 <code>device &lt;id&gt;</code>。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>init_groups = 连通分量</strong>：① 并查集（记录“这个 device 第一次被谁占”，再遇到就 union）；② 二部图 BFS/DFS。规模很小，关键是传递性。</li>
+<li><strong>run_init 结构</strong>：先 init_groups；每组一个任务提交到 <code>ThreadPoolExecutor(max_workers)</code>；任务内部按 stage id 顺序调用 init_fn。with 块退出会 join 所有任务——这正是“等正在跑的结束”。</li>
+<li><strong>共享状态</strong>：results、failure，用一把 Lock 保护。每个组在调用每个 init_fn 之前检查 failure，有就 return。</li>
+<li><strong>异常在任务内部 try/except</strong>（捕获 BaseException），把 (sid, e) 写进共享状态。</li>
+<li><strong>cleanup 放在线程池关闭之后</strong>。</li>
+<li><strong>admission_check</strong>：外层排序遍历 device_total_bytes，内层找出所有 dev in devices 的 stage，累加 <code>int(util * total) + reserve</code>，<code>need &gt; total</code> 才报错。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>{0:{0,1}, 1:{1,2}, 2:{2}}：stage0 与 stage2 不直接共享卡，但都与 stage1 共享；若分开就会出现同卡并发。所以整个连通分量串行。</li>
+<li>每个 stage init 会“测空闲显存 → 定 KV block 数”；同卡上另一个 stage 在加载/profile 时测量会偏。不同卡互不影响，所以组间并行缩短启动时间。</li>
+<li>不中断，让它跑完；它成功就进 results，稍后统一 cleanup。</li>
+<li>等线程池全部 join 之后。</li>
+<li>报第一个被记录的失败；锁内 <code>if not failure: failure.append(...)</code> 保证只记一次。</li>
+<li>按每张所在卡各自的 total 算，在每张卡上各算一次（含各自的 reserve）。</li>
+<li><code>need &gt; total</code> 才报错（相等允许）；空卡 need=0，不输出。</li>
+</ol>
+</div></details>
+<p><strong>思考延伸</strong>：max_workers 小于组数时，后面的组会排队；排到时发现已有失败就直接 return——这就是例 2 中 stage2 从未被调用的原因。max_workers 足够大时组[2] 可能已在跑，那么它会跑完并被 cleanup——两种行为都符合 spec，所以写单测时要用 Event 控制时序，而不是依赖 sleep。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>真正并行初始化同卡 stage 时，怎样用跨进程读写锁让“测量空闲显存”独占？</li>
+</ul>
+<p>对照源码：<code>engine/stage_runtime.py:879-956</code> · <code>engine/stage_init_utils.py:1738-1762</code> · <code>engine/stage_admission.py:205</code> · <code>engine/stage_phase_lock.py:106-238</code></p>
+<nav class="pager"><a class="prev" href="p18_overview.html"><small>← 上一题</small>#24 · P18 MRoPE 三维位置</a><a class="next" href="p17_overview.html"><small>下一题 →</small>#26 · P17 CUDA graph bucket runner（CPU 模拟）</a></nav>
+</main>
+</body>
+</html>

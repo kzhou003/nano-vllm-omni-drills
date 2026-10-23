@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P05 提示 · RpcRouter：共享通道上的 RPC 关联</title>
+<meta name="description" content="sleep / wake_up / collective_rpc 的结果和其他控制消息挤在同一条回传队列上，多个线程同时在等各自的结果——要按 key 把结果关联回正确的调用方。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p04_overview.html">← <span class="lbl">P04</span></a><a href="p10_overview.html"><span class="lbl">P10</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#13 · Track A · 前端与 Orchestrator · 书 p.61</div>
+<h1>P05 · RpcRouter：共享通道上的 RPC 关联</h1>
+<p class="lede">sleep / wake_up / collective_rpc 的结果和其他控制消息挤在同一条回传队列上，多个线程同时在等各自的结果——要按 key 把结果关联回正确的调用方。</p>
+<div class="badges">
+<span class="badge">⏱ <b>40 min</b></span>
+<span class="badge diff-易">难度 <b>易</b></span>
+<span class="badge">实现 <code>mine/p05_rpc_router.py</code></span>
+<span class="badge">验收 <code>./check.sh p05</code></span>
+<span class="badge">提示 <b>A-13</b> · 参考解 <b>C-13</b> <code>solutions/p05_rpc_router.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P05">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC · LIFE</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：为什么 unregister 要比较身份</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：前端的 collective_rpc、abort、sleep 是同步 API：调用线程把请求放进 request 队列然后阻塞等结果。所有结果都从同一个 <code>rpc_output_queue</code> 回来，由一个 router 线程按 key 分发给等待者。</li>
+<li><strong>三个经典坑</strong>：
+<ol>
+<li><strong>先发送后注册</strong>：结果可能在注册之前就到了 → 被当成“没人要”丢掉 → 调用者永远等。必须先注册再发送。</li>
+<li><strong>超时后不注销</strong>：迟到结果塞进没人读的队列；同一个 key 再次使用会读到旧结果。必须在 finally 里注销，且只注销自己的 waiter（用 <code>is</code> 比较）。</li>
+<li><strong>致命错误时没有广播</strong>：orchestrator 线程挂了，所有等待者要立即收到错误，而不是各自等到超时；之后的新调用也应立即失败（锁存）。</li>
+</ol>
+</li>
+<li><strong>接口</strong>：<code>register / unregister / deliver / fail_all / call(key, send, timeout)</code>，所有方法都可能被不同线程并发调用。每个 waiter 是 <code>queue.Queue(maxsize=1)</code>。</li>
+</ul>
+<p><strong>验收要点</strong>：50 个线程并发调用、结果乱序回传，各自拿到自己的 · send() 内同步回传的结果不丢 · 超时 → TimeoutError、迟到结果被丢弃并计数、key 可复用 · 重复 key 报错 · fail_all 立刻唤醒所有等待者并锁存错误。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">奶茶店的取餐器</div><p>点单时店员先给你一个取餐器（<code>register(key)</code> 返回的 <code>Queue(maxsize=1)</code>），然后才把单子递进后厨（<code>send()</code>）。后厨做好哪杯就呼叫哪个号（<code>deliver</code>），出餐顺序与点单无关。① 先领取餐器再下单：后厨手快，单子刚递进去饮料就好了，你手上还没取餐器，这杯只好放到“无人认领”（<code>late_results += 1</code>），你干等。② 等不及走了（超时），一定要把取餐器还回去（finally: unregister）。③ 还的是你手上那一个（<code>is</code> 比较），而不是“把 17 号作废”——17 号可能已经发给下一位客人。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">后厨着火（fail_all）</div><p>店员不是让每个客人各自等到不耐烦，而是立刻广播“所有取餐器作废”（把错误放进每个在等的信箱），并在门口挂“暂停营业”（锁存）：之后来的客人连单都不用下，进门就被告知（register / call 立即抛错，send 根本不会被调用）。</p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC · LIFE</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>P05</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>纯线程：N 个调用方线程 + 1 个结果通道线程 + 偶尔调用 fail_all 的线程。没有事件循环，同步原语是 <code>threading.Lock</code> 和 <code>queue.Queue</code></td>
+</tr>
+<tr>
+<td>S</td>
+<td><code>waiters: dict[key → Queue(1)]</code>、锁存的 fatal、late_results——多线程读改写 → 同一把锁；“检查 fatal + 插入 waiter”必须在同一次加锁里</td>
+</tr>
+<tr>
+<td>B</td>
+<td>调用方阻塞在 <code>waiter.get(timeout)</code>——绝不能持锁；deliver / fail_all 的 put 也放在锁外</td>
+</tr>
+<tr>
+<td>W</td>
+<td>调用方：登记、发送、等待、注销自己的；结果线程：只按 key 取出 waiter 并交付，不看结果内容；fail_all：清空并广播</td>
+</tr>
+<tr>
+<td>C</td>
+<td>出：send()；回：一条共享结果通道；每个调用一个私有 <code>Queue(maxsize=1)</code> 当信箱</td>
+</tr>
+<tr>
+<td>L</td>
+<td>waiter 的一生：register → 被 deliver 取走 / 被 fail_all 清空 / 被 finally 的 unregister 删除，有且只有一条路真正摘掉它。router 一生：正常 → fail_all 后永久“锁死”</td>
+</tr>
+<tr>
+<td>I</td>
+<td>call 只有四种结局：返回结果 / raise 结果里的异常 / TimeoutError / raise 锁存的致命错误；无论哪种，返回时表里都不再有它的 waiter</td>
+</tr>
+<tr>
+<td>F</td>
+<td>① 同一 key 最多一个活着的 waiter；② 每个 waiter 最多收到一个结果；③ fatal 一旦设置，表里不会再出现新 waiter；④ 登记一定先于发送</td>
+</tr>
+<tr>
+<td>E</td>
+<td>迟到 / 未知 key → 计数丢弃；重复 key → ValueError；send 自己抛错 → finally 照样注销；结果在“已 pop、调用方刚好超时”的缝里到达 → 悄悄丢弃（可接受，不算 late）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>先 send 后 register：send 内同步 deliver 的结果被计为 late，调用方等满超时。</li>
+<li>超时后不注销：同一 key 第二次 call 报“重复 key”；或（若允许覆盖）读到上一轮迟到的旧结果。</li>
+<li>unregister 不比较身份：A 超时的 finally 把 B 刚注册的 waiter 删掉，B 的结果被当成 late，B 卡到超时。</li>
+<li>持锁 put / 持锁 get：死锁或所有调用串行化。</li>
+<li>fail_all 只唤醒不锁存：之后的新调用照常 send 并等满超时。</li>
+<li>deliver 用 get 而不是 pop：同一个 key 可能被交付两次。</li>
+</ul>
+<h2 id="s5">逐步图：为什么 unregister 要比较身份</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ A 超时、B 复用同一个 key k</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. t1：A register</div><p>A：<code>register(k)</code> → wA。表：k → <strong>wA</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">2. t2：A 超时；router 恰好 deliver(k, resA)</div><p>A 的 <code>get</code> 超时，准备进 finally。router：<code>deliver(k, resA)</code> 在锁里 <strong>pop 出 wA</strong>，锁外 put。表：（空）</p>
+<p>wA 收到了 resA 但 A 已放弃——这条结果悄悄丢弃，它<strong>不算 late</strong>（确实有 waiter 接住了）。</p>
+</div><div class="step" data-hl=""><div class="step-title">3. t3：B register</div><p>B：<code>register(k)</code> → wB。表：k → <strong>wB</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">4. t4：A 的 finally</div><p><code>unregister(k, wA)</code>：表里是 wB，<code>waiters.get(k) is wA</code> 为 False → <strong>不删</strong>。表：k → wB</p>
+</div><div class="step" data-hl=""><div class="step-title">5. t5：deliver(k, resB)</div><p>pop 出 wB → True，B 拿到 resB。表：（空）</p>
+<p>如果 t4 不比较直接 <code>del waiters[k]</code>：t5 找不到 waiter，resB 被当成 late，B 白等到超时。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1：两个线程并发调用，结果乱序回来</strong></p>
+<pre><code class="language-python">r = RpcRouter()
+def send_for(key, val, delay):     # 模拟 router 线程稍后回传结果
+    return lambda: threading.Timer(delay, lambda: r.deliver(key, val)).start()
+
+线程 1: r.call(&quot;sleep&quot;, send_for(&quot;sleep&quot;, &quot;ok-sleep&quot;, 0.05), timeout=1)   -&gt; &quot;ok-sleep&quot;
+线程 2: r.call(&quot;wake&quot;,  send_for(&quot;wake&quot;,  &quot;ok-wake&quot;,  0.01), timeout=1)   -&gt; &quot;ok-wake&quot;
+# 结果在 send() 内部就同步回来了，也不能丢：
+r.call((&quot;rpc&quot;, 7), lambda: r.deliver((&quot;rpc&quot;, 7), {&quot;gpu_mem&quot;: 3}), timeout=0.1)  -&gt; {&quot;gpu_mem&quot;: 3}
+</code></pre>
+<p><strong>例 2：超时、迟到、key 复用、异常结果</strong></p>
+<pre><code class="language-python">r.call(&quot;ping&quot;, lambda: None, timeout=0.1)     # 约 0.1s 后抛 TimeoutError
+r.deliver(&quot;ping&quot;, &quot;pong&quot;)                     # -&gt; False（已经没人在等）
+r.late_results                                # -&gt; 1
+r.call(&quot;ping&quot;, lambda: r.deliver(&quot;ping&quot;, &quot;pong2&quot;), timeout=0.1)   # -&gt; &quot;pong2&quot;
+r.call(&quot;bad&quot;, lambda: r.deliver(&quot;bad&quot;, ValueError(&quot;no such method&quot;)), timeout=0.1)
+# -&gt; 抛出 ValueError：结果本身是异常对象时 raise 而不是 return
+w = r.register(&quot;dup&quot;); r.register(&quot;dup&quot;)      # 第二次 -&gt; ValueError
+</code></pre>
+<p><strong>例 3：fail_all 广播并锁存</strong>：3 个线程 <code>call(&quot;w0&quot;/&quot;w1&quot;/&quot;w2&quot;, send=lambda: None, timeout=5)</code> 阻塞；主线程 <code>r.fail_all(RuntimeError(&quot;orch dead&quot;))</code> → 3 个线程几乎立刻各自抛出；之后 <code>call(&quot;after&quot;, …)</code> 立即抛、send 不会被调用；<code>register(&quot;x&quot;)</code> 同样立即抛；late_results 不变。</p>
+<h4>关键问题</h4>
+<ol>
+<li>为什么必须先 register 再 send()？构造一个“先 send 后 register”会永远等下去的时序。</li>
+<li>waiter 为什么是 <code>Queue(maxsize=1)</code>？deliver 放结果时会不会阻塞？</li>
+<li>一个 waiter 会被谁从表里移除：deliver、call 的 finally，还是两者？怎么保证不互相踩？</li>
+<li><code>unregister(key, waiter)</code> 为什么要多传一个 waiter，并且只在“表里那个就是我这个”时才删？</li>
+<li>deliver 需要锁吗？锁里做什么、锁外做什么？</li>
+<li><code>waiter.get(timeout=...)</code> 超时抛什么异常？对外抛什么？</li>
+<li>fail_all 之后，正在等的和以后才来的调用分别怎么处理？锁存存在哪、谁来检查？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>key 是任意 Hashable（字符串或 <code>(&quot;rpc&quot;, 7)</code> 元组）；同一时刻一个 key 只能有一个活着的 waiter。</li>
+<li>deliver：有 waiter 交给它返回 True；否则返回 False 且 <code>late_results += 1</code>。</li>
+<li>结果通道上传回来的可能是异常对象（远端执行失败或 fail_all 的致命错误）：call 拿到 BaseException 实例就 raise。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>状态</strong>：<code>threading.Lock</code>、<code>waiters: dict[key, Queue]</code>、<code>fatal: BaseException | None</code>、<code>late_results</code>。</li>
+<li><strong>register</strong>：锁内：fatal 已设置 → raise fatal；key 已在表 → ValueError；否则新建 <code>Queue(maxsize=1)</code> 放进表并返回。</li>
+<li><strong>deliver</strong>：锁内 <code>pop(key, None)</code>——pop 保证同一 key 只交付一次；拿不到就计数返回 False。锁外 <code>put_nowait(result)</code>。</li>
+<li><strong>unregister</strong>：锁内仅当 <code>waiters.get(key) is waiter</code> 时删除。</li>
+<li><strong>call</strong>：<code>w = register(key)</code> → <code>try: send(); w.get(timeout)</code>，<code>queue.Empty</code> 转成 TimeoutError；结果是异常就 raise，否则 return → <code>finally: unregister(key, w)</code>。register 在 try 外：register 失败时没有东西需要注销。</li>
+<li><strong>fail_all</strong>：锁内设置 fatal、取出所有 waiter、清空表；锁外逐个 <code>put_nowait(error)</code>（防御性忽略 queue.Full）。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>send 可能在返回前（甚至在 send 内部）就触发 deliver。先 send：deliver 时表里没 key → 计为 late；随后 register → 永远等不到。</li>
+<li>每个 waiter 只会收到一个结果（deliver 用 pop 保证）。容量 1 足够，put_nowait 一定成功，router 线程不会被慢消费者卡住。</li>
+<li>两者都可能：正常交付时 deliver 先 pop，finally 的 unregister 发现表里不是自己就什么都不做；超时时 deliver 没来，finally 负责删除。</li>
+<li>见逐步图。</li>
+<li>需要；锁内只做 dict 的 pop 和计数，锁外 put。持锁做任何可能阻塞的操作都会把其他线程堵住。</li>
+<li><code>queue.Empty</code>；对外转成内置 TimeoutError（可 <code>from None</code> 去掉无关的链式异常）。</li>
+<li>正在等的：fail_all 直接把 error 放进它们的 waiter，call 拿到后 raise。以后的：fatal 存在 router 里，register 检查到就立即 raise。</li>
+</ol>
+</div></details></div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>为什么 orchestrator 内联执行 RPC 会阻塞后续请求准入？怎么改？</li>
+</ul>
+<p>对照源码：<code>engine/rpc_result_router.py:32-150</code> · <code>engine/messages.py:125-148</code></p>
+<nav class="pager"><a class="prev" href="p04_overview.html"><small>← 上一题</small>#12 · P04 StagePool：粘性绑定、两阶段 abort、故障隔离</a><a class="next" href="p10_overview.html"><small>下一题 →</small>#14 · P10 EngineCore busy loop</a></nav>
+</main>
+</body>
+</html>

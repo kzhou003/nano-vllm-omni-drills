@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M01 提示 · RMSNorm 与多模态 RoPE（interleaved / chunked）</title>
+<meta name="description" content="thinker 的每一层都从 RMSNorm 开始，每个 attention 都要对 q/k 做三维 (t,h,w) 旋转位置编码；Qwen3 与 Qwen2.5 的频率布局不同——错一位不会报错，只会悄悄变笨。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="m02_overview.html"><span class="lbl">M02</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#1 · Track M · Qwen-Omni 模型实现 · 书 p.19</div>
+<h1>M01 · RMSNorm 与多模态 RoPE（interleaved / chunked）</h1>
+<p class="lede">thinker 的每一层都从 RMSNorm 开始，每个 attention 都要对 q/k 做三维 (t,h,w) 旋转位置编码；Qwen3 与 Qwen2.5 的频率布局不同——错一位不会报错，只会悄悄变笨。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/m01_rmsnorm_mrope.py</code></span>
+<span class="badge">验收 <code>./check.sh m01</code></span>
+<span class="badge">提示 <b>A-1</b> · 参考解 <b>C-1</b> <code>solutions/m01_rmsnorm_mrope.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="M01">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：频率分给哪个轴？</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：thinker（stage 0）每个 decoder layer：<code>h = h + Attn(RMSNorm(h))</code>、<code>h = h + MoE(RMSNorm(h))</code>，Attention 里对 q、k 施加旋转位置编码。talker 用同样的组件；M02、M08 会复用这里的函数。</li>
+<li><strong>RMSNorm 数值约定</strong>：<code>y = w · x / sqrt(mean(x²) + eps)</code>。HF/vLLM 的细节：<strong>先把 x 转 fp32 做归一化，转回输入 dtype 之后再乘 weight</strong>。bf16 下顺序不同就不 bitwise 一致。</li>
+<li><strong>RoPE</strong>：head_dim = D，频率 j（0 ≤ j &lt; D/2）的角速度 <code>inv_freq[j] = θ^(-2j/D)</code>，位置 p 的角度为 <code>p·inv_freq[j]</code>；cos/sin 形状 <code>[T, D]</code>（两半各复制一次）；旋转 <code>x·cos + rotate_half(x)·sin</code>，<code>rotate_half([a,b]) = [-b, a]</code>。</li>
+<li><strong>MRoPE 三维位置</strong>：每个 token 有 (t, h, w)。文本三者相同；图像 patch 有各自网格坐标；音频沿时间线性。<code>mrope_section</code>（真实 Qwen3-Omni 为 <code>[24, 20, 20]</code>，和为 64 = 128/2）给出每个轴分到几个<strong>频率</strong>。</li>
+</ul>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>模型</th>
+<th>布局（D/2 = 8，section = [4,2,2] 为例）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2-VL / Qwen2.5-Omni：chunked</td>
+<td><span class="cells"><span class="cell t">T</span><span class="cell t">T</span><span class="cell t">T</span><span class="cell t">T</span><span class="cell h">H</span><span class="cell h">H</span><span class="cell w">W</span><span class="cell w">W</span></span></td>
+</tr>
+<tr>
+<td>Qwen3-VL / Qwen3-Omni：interleaved</td>
+<td><span class="cells"><span class="cell t">T</span><span class="cell h">H</span><span class="cell w">W</span><span class="cell t">T</span><span class="cell h">H</span><span class="cell w">W</span><span class="cell t">T</span><span class="cell t">T</span></span></td>
+</tr>
+</tbody>
+</table></div>
+<p>interleaved 规则：<code>j%3==1 且 j&lt;3·section[1]</code> → H；<code>j%3==2 且 j&lt;3·section[2]</code> → W；其余 → T。动机：每个轴都同时拿到高频和低频分量，而 chunked 让 W 轴只拿到最低频。</p>
+<p><strong>要实现</strong>：<code>rms_norm</code>、<code>rope_inv_freq</code>、<code>mrope_cos_sin(inv_freq, positions[3,T], section, interleaved)</code>、<code>rotate_half</code>、<code>apply_rotary(x[T,heads,D], cos, sin)</code>。本套题 q/k 用 <code>[T, heads, D]</code>（vLLM 风格，token 在前），HF 用 <code>[B, heads, T, D]</code>，测试会帮你转。</p>
+<p><strong>验收要点</strong>：RMSNorm 在 fp32 / bf16 下都与 HF 一致 · inv_freq 一致 · interleaved cos/sin 与 HF Qwen3-Omni 一致（含图像网格位置）· 纯文本时两种布局都退化为 1D RoPE · apply_rotary 后 q/k 一致 · chunked 与 HF Qwen2.5-Omni 一致。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">音量归一化 + 均衡器</div><p>一个歌单里每首歌音量不同。RMSNorm 先把每首歌（每个 token 的 hidden 向量）的整体响度拉到同一水平（除以 RMS），再用均衡器（<code>weight</code>，每个维度一个旋钮）调每个频段。
+“先转回 x.dtype 再乘 weight”就像：先把音频导出成 16-bit 再过均衡器，还是在 32-bit 工程里过完均衡器再导出——耳朵听不出差别，但逐字节比较不一样，parity 测试就是那个逐字节比较的人。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">一排转速不同的钟表指针</div><p>把 head_dim = D 的向量拆成 D/2 对，每一对是一根指针。第 j 根指针转速 <code>inv_freq[j] = θ^(-2j/D)</code>：j = 0 最快（秒针），j 越大越慢（时针、日历）。token 在位置 p 时，第 j 根指针转到角度 <code>p · inv_freq[j]</code>。
+两个 token 做点积只留下<strong>角度差</strong> → attention 天然感知相对位置。快指针分辨“隔壁 vs 隔两个”，慢指针分辨“隔 10 个 vs 隔 1000 个”。旋转不改变长度，所以 RoPE 不会破坏 QK-norm 刚归一化好的范数。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">发牌：一人一摞 vs 轮流发</div><p>把 64 张牌按“快 → 慢”排好，发给 T、H、W 三位玩家。<strong>chunked</strong>：前 24 张给 T、接着 20 张给 H、最后 20 张给 W——W 只拿到最慢的指针，相邻两列 patch 角度几乎没差别。<strong>interleaved</strong>：轮流发 T H W T H W …，H、W 的份额发完后剩下的全给 T，每个轴都同时拿到快指针和慢指针。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<p>记号：T 个 token，D = head_dim，half = D/2，heads 为 q 或 k 的 head 数。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>tensor</th>
+<th>shape / dtype</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>x → rms_norm</code></td>
+<td><code>[..., H]</code> 任意 dtype</td>
+<td>转 fp32，最后一维 <code>mean(x²)</code>（keepdim），乘 <code>rsqrt(·+eps)</code>，<strong>转回 x.dtype，再乘 weight</strong></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>inv_freq</code></td>
+<td><code>[half]</code> fp32</td>
+<td><code>θ^(-2j/D)</code>，j = 0 … half-1</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>positions</code></td>
+<td><code>[3, T]</code> int</td>
+<td>三行依次是 t、h、w；文本 token 三行相同</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>freqs</code></td>
+<td><code>[3, T, half]</code> fp32</td>
+<td>一次广播：每个轴、每个 token、每根指针的角度</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>f</code></td>
+<td><code>[T, half]</code></td>
+<td>对每一列 j 从三个轴里<strong>选一个拷过来</strong>（只选列，不做新运算）；interleaved / chunked 只差在这里</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>emb</code></td>
+<td><code>[T, D]</code></td>
+<td><code>cat([f, f], -1)</code>：第 j 列与第 j+half 列角度相同</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>cos, sin</code></td>
+<td><code>[T, D]</code> fp32</td>
+<td><code>emb.cos()</code>、<code>emb.sin()</code></td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>apply_rotary(x)</code></td>
+<td><code>x[T, heads, D]</code></td>
+<td>cos/sin 插入 head 维变 <code>[T, 1, D]</code>、转成 x.dtype；<code>x·cos + rotate_half(x)·sin</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>bf16 下 RMSNorm 在 fp32 里<strong>先乘 weight 再转回</strong>：数值“差不多”，但不 bitwise 一致。</li>
+<li><code>mean</code> 忘了 <code>keepdim=True</code>，或对全部维度求 mean。</li>
+<li>interleaved 时直接改了 <code>freqs[0]</code>（没 <code>clone</code>），或切片终点写成 <code>section</code> 而不是 <code>3 · section</code>。</li>
+<li>chunked 时 H 段取了 <code>freqs[1]</code> 的第 <code>0..s_h</code> 列，而不是<strong>同一列区间</strong> <code>s_t..s_t+s_h</code>。</li>
+<li>把每个频率相邻复制两次（<code>repeat_interleave</code>，GPT-J 风格），与“前后半配对”的 <code>rotate_half</code> 不匹配。</li>
+<li><code>rotate_half</code> 写成 <code>[b, -a]</code>：旋转方向反了。</li>
+<li>cos 直接与 <code>[T, heads, D]</code> 相乘：当 <code>T == heads</code> 时不会报错，但 T 维被错误地对齐到了 heads 维。</li>
+</ul>
+<h2 id="s5">逐步图：频率分给哪个轴？</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 用 acos(cos) “看见”每个频率跟哪个轴转</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 设定一个可以肉眼读的输入</div><p>取 <code>inv_freq = ones(10)</code>（D = 20，half = 10），单个 token，<code>positions = [[1],[2],[3]]</code>（t=1, h=2, w=3）。</p>
+<p>这样每个频率的角度 = 它所用轴的位置，<code>acos(cos[0])</code> 直接告诉你第 j 个频率跟哪个轴转：1 = T 轴，2 = H 轴，3 = W 轴。</p>
+<p>这是 L2 推荐的自测技巧：<strong>用 ones 的 inv_freq + 互不相同的小整数位置</strong>。</p>
+</div><div class="step" data-hl=""><div class="step-title">2. section = [4,3,3]，interleaved=True</div><p>j = 0…9 的来源轴：</p>
+<p><span class="cells"><span class="cell t">1</span><span class="cell h">2</span><span class="cell w">3</span><span class="cell t">1</span><span class="cell h">2</span><span class="cell w">3</span><span class="cell t">1</span><span class="cell h">2</span><span class="cell w">3</span><span class="cell t">1</span></span> | 后半段（j = 10…19）是前半段的复制</p>
+<ul>
+<li>H 占 j = 1, 4, 7（<code>slice(1, 3·3=9, 3)</code>，共 3 个 = s_h）</li>
+<li>W 占 j = 2, 5, 8（<code>slice(2, 9, 3)</code>，共 3 个 = s_w）</li>
+<li>其余（0, 3, 6, 9）是 T，共 4 个 = s_t</li>
+</ul>
+</div><div class="step" data-hl=""><div class="step-title">3. section = [4,3,3]，interleaved=False（chunked）</div><p><span class="cells"><span class="cell t">1</span><span class="cell t">1</span><span class="cell t">1</span><span class="cell t">1</span><span class="cell h">2</span><span class="cell h">2</span><span class="cell h">2</span><span class="cell w">3</span><span class="cell w">3</span><span class="cell w">3</span></span> | 后半段同前半段</p>
+<p>三段连续：<code>freqs[0][:, 0:4]</code>、<code>freqs[1][:, 4:7]</code>、<code>freqs[2][:, 7:10]</code>——注意 H 段取的是 <strong>同一列区间 4..7</strong>，不是 <code>freqs[1][:, 0:3]</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">4. section = [6,2,2]，interleaved=True</div><p><span class="cells"><span class="cell t">1</span><span class="cell h">2</span><span class="cell w">3</span><span class="cell t">1</span><span class="cell h">2</span><span class="cell w">3</span><span class="cell t on">1</span><span class="cell t on">1</span><span class="cell t on">1</span><span class="cell t on">1</span></span></p>
+<p>H、W 只占前 <code>3·section</code> 个“槽位”：<code>slice(1, 6, 3)</code> → 1, 4；<code>slice(2, 6, 3)</code> → 2, 5。之后（j ≥ 6，高亮）全是 T。</p>
+<p>这就是为什么切片终点必须是 <code>3 * section[axis]</code> 而不是 <code>half</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">5. 纯文本：三轴位置相同</div><p>文本 token 的 positions 三行相同 → <code>freqs[0] == freqs[1] == freqs[2]</code> → 不管每列从哪个轴拷，结果都一样。</p>
+<p>所以 interleaved 和 chunked 都 <strong>bitwise 退化成普通 1D RoPE</strong>（测试会检查这一点）。</p>
+</div><div class="step" data-hl=""><div class="step-title">6. cat([f, f]) 与 rotate_half 的配对</div><p><code>emb = cat([f, f], -1)</code>：第 j 列和第 j + D/2 列角度相同。</p>
+<p><code>rotate_half([x0, x1 | x2, x3]) = [-x2, -x3 | x0, x1]</code>，于是 <code>x·cos + rotate_half(x)·sin</code> 正好把 (x0, x2)、(x1, x3) 各自做一次二维旋转：</p>
+<pre><code>out[0] = x0·cos θ0 − x2·sin θ0
+out[2] = x2·cos θ0 + x0·sin θ0
+</code></pre>
+<p>GPT-J 风格（相邻两维配对、<code>repeat_interleave</code>）与这里的 neox 风格不兼容。</p>
+</div><div class="step" data-hl=""><div class="step-title">7. apply_rotary 的广播</div><p>x 是 <code>[T, heads, D]</code>，cos/sin 是 <code>[T, D]</code>。必须 <code>cos[:, None, :]</code> → <code>[T, 1, D]</code>。</p>
+<p>直接相乘时 PyTorch 从右对齐：<code>[T, D]</code> 会被当成 <code>[heads, D]</code>——<code>T == heads</code> 时<strong>不报错但全错</strong>。</p>
+<p>bf16 输入时 cos/sin 先 <code>.to(x.dtype)</code> 再乘（与 HF 一致）。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>rms_norm</strong>：<code>x = [[3, 4], [1, 1]]</code>（fp32），<code>weight = [1, 2]</code>，<code>eps = 0</code>。</p>
+<pre><code>row0: mean(x²) = (9+16)/2 = 12.5, rsqrt = 1/3.5355
+      x̂ = [0.8485, 1.1314] -&gt; * weight -&gt; [0.8485, 2.2627]
+row1: mean(x²) = 1 -&gt; x̂ = [1, 1] -&gt; * weight -&gt; [1.0000, 2.0000]
+</code></pre>
+<p>对最后一维求 mean（每行独立），输出形状与 x 相同。</p>
+<p><strong>rope_inv_freq</strong>：<code>rope_inv_freq(8, 10000.0) → [1.0000, 0.1000, 0.0100, 0.0010]</code>（长度 D/2 = 4）；<code>rope_inv_freq(6, 100.0) → [1.0000, 0.2154, 0.0464]</code>。</p>
+<p><strong>mrope_cos_sin 的轴分配</strong>（<code>inv_freq = ones(10)</code>，positions = t1/h2/w3，<code>acos(cos[0])</code>）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>section / 布局</th>
+<th>acos(cos[0])（长度 20）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>[4,3,3]</code>, interleaved=True</td>
+<td>1 2 3 1 2 3 1 2 3 1 | 1 2 3 1 2 3 1 2 3 1</td>
+</tr>
+<tr>
+<td><code>[4,3,3]</code>, interleaved=False</td>
+<td>1 1 1 1 2 2 2 3 3 3 | 1 1 1 1 2 2 2 3 3 3</td>
+</tr>
+<tr>
+<td><code>[6,2,2]</code>, interleaved=True</td>
+<td>1 2 3 1 2 3 1 1 1 1 |（后半同前半）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>rotate_half / apply_rotary</strong>：<code>rotate_half([1, 2, 3, 4]) = [-3, -4, 1, 2]</code>。取 D = 4，<code>inv_freq = [1, 0.01]</code>，纯文本位置 p = 2（section=[1,1,0]，interleaved）：</p>
+<pre><code>cos = [cos2, cos0.02, cos2, cos0.02] = [-0.4161, 0.9998, -0.4161, 0.9998]
+sin = [ 0.9093, 0.0200, 0.9093, 0.0200]
+apply_rotary(x=[[[1,0,0,0]]]) = [[[-0.4161, 0, 0.9093, 0]]]       # 维度 0 与维度 2 组成一对
+apply_rotary(x=[[[1,2,3,4]]]) = [[[-3.1440, 1.9196, -0.3391, 4.0392]]]
+</code></pre>
+<h4>关键问题</h4>
+<ol>
+<li>RMSNorm 里“先转回 x.dtype 再乘 weight”和“fp32 里乘完 weight 再转回”在 fp32 输入下有区别吗？bf16 下呢？为什么？</li>
+<li><code>torch.arange(0, head_dim, 2)</code> 得到什么？除以 head_dim 后指数范围是多少？inv_freq 长度是多少？</li>
+<li>positions <code>[3, T]</code>、inv_freq <code>[D/2]</code>，怎样一次广播得到 <code>freqs[3, T, D/2]</code>？</li>
+<li>interleaved 下 j = 7、section = [4,3,3] 时属于哪个轴？section = [6,2,2] 呢？</li>
+<li>rotate_half 中维度 j 与 j+1 配对，还是与 j + D/2 配对？这和 <code>cat([f, f])</code> 有什么关系？</li>
+<li>纯文本（三轴位置相同）时 interleaved 与 chunked 的 cos/sin 是什么关系？</li>
+<li>apply_rotary 里 x 是 <code>[T, heads, D]</code>、cos 是 <code>[T, D]</code>，怎样 reshape 才能正确广播？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>“normalize in fp32, cast back, THEN multiply by weight”：<code>x * rsqrt(mean(x², -1) + eps)</code> 全程 fp32；结果先 <code>.to(x.dtype)</code> 再乘 weight。bf16 下两种顺序有 1 ulp 量级差异（例：正确顺序 <code>1.9140625</code>，fp32 先乘得 <code>1.90625</code>）。</li>
+<li>inv_freq 显式 <code>dtype=torch.float32</code> 最稳；<code>theta ** tensor</code> 是标量的逐元素幂。</li>
+<li><code>mrope_section = [s_t, s_h, s_w]</code>，和为 D/2，是“每个轴分到多少个<strong>频率</strong>”（维度数是 2 倍）。</li>
+<li>cos/sin 形状 <code>[T, head_dim]</code>：先在 <code>[T, D/2]</code> 上完成轴选择，再 <code>cat([f, f], -1)</code>，最后 <code>.cos() / .sin()</code>。</li>
+<li>Qwen3 vs Qwen2.5：inv_freq、rotate_half、apply 公式完全相同，唯一区别是“频率 j 用哪个轴的位置”——这就是 <code>interleaved</code> 这个 bool 的全部含义。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>拆分</strong>：五个函数层层组合 <code>rope_inv_freq → mrope_cos_sin → apply_rotary</code>（内部调用 <code>rotate_half</code>），<code>rms_norm</code> 独立。按这个顺序写，每写完一个用 L1 的数字自测。</li>
+<li><strong>rms_norm</strong>：<code>x32 = x.float()</code> → <code>x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)</code> → <code>.to(x.dtype)</code> 后乘 weight。常见错：忘 keepdim、eps 放在 sqrt 外、对全部维度求 mean。</li>
+<li><strong>mrope_cos_sin 的核心是“选择”而非“计算”</strong>：先一次算出三条轴各自的 <code>freqs[a]</code>（<code>[T, D/2]</code>），再构造 <code>[T, D/2]</code> 的 f，每一列 j 从某个轴的 freqs 拷过来。</li>
+<li><strong>interleaved</strong>：以 T 轴为底（<strong>拷贝一份</strong>，避免改到原 tensor），再用步长 3 的切片覆盖 H 的列（起点 1）和 W 的列（起点 2），终点由对应 section 决定。也可以先构造长度 D/2 的 <code>axis_of_j</code> 向量再 gather。</li>
+<li><strong>chunked</strong>：维护起点游标，依次从 freqs[0]、freqs[1]、freqs[2] 切出长度 s_t、s_h、s_w 的列段再拼起来。切的是<strong>同一个列区间</strong>。</li>
+<li><strong>rotate_half</strong>：<code>chunk(2, dim=-1)</code> 切成 a、b，返回 <code>cat([-b, a], -1)</code>。错误：<code>[b, -a]</code>（sin 符号整体翻转），或按奇偶位切（GPT-J 风格）。</li>
+<li><strong>apply_rotary 广播</strong>：<code>cos[:, None, :]</code>。直接相乘会把 cos 的 T 维对齐到 x 的 heads 维——T == heads 时不报错但结果错，这是最阴险的 bug。</li>
+<li><strong>自测技巧</strong>：<code>inv_freq = ones</code> + 互不相同的小整数位置（1/2/3）跑 mrope_cos_sin，取 <code>acos</code> 肉眼看每列来自哪个轴；三轴相同的位置验证两种布局都退化为普通 RoPE。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案与骨架要点<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>fp32 输入下 <code>.to(x.dtype)</code> 是 no-op，两种顺序相同；bf16 下“先 round 到 bf16 再乘 bf16 weight”和“fp32 乘完再 round”舍入点不同，可能差 1 ulp。</li>
+<li><code>arange(0, D, 2) = [0, 2, …, D-2]</code>，除以 D 后指数在 [0, 1)；inv_freq 长度 D/2，单调递减，从 1 到接近 1/θ。</li>
+<li><code>positions.float()[:, :, None] * inv_freq[None, None, :]</code> → <code>[3, T, D/2]</code>。</li>
+<li>j = 7：7 % 3 == 1；section=[4,3,3] 时 3·3 = 9 &gt; 7 → <strong>H</strong>；section=[6,2,2] 时 3·2 = 6 ≤ 7 → <strong>T</strong>。</li>
+<li>维度 j 与 j + D/2 配对；<code>cat([f, f])</code> 让第 j 列和第 j+D/2 列角度相同，rotate_half 正好把这两列组成一个二维旋转。</li>
+<li>三轴相同 → 三条 freqs 完全一样 → 无论怎么选列结果都相同，两种布局 bitwise 相同。</li>
+<li><code>cos[:, None, :]</code>（<code>[T, 1, D]</code>）。</li>
+</ol>
+</div></details>
+<p><strong>mrope_cos_sin 形状追踪</strong>（T 个 token，D = head_dim，half = D/2）：</p>
+<pre><code>positions [3, T] --float--&gt; [3, T, 1] * inv_freq [1, 1, half] = freqs [3, T, half]
+选择列                                                   -&gt; f   [T, half]
+cat([f, f], -1)                                          -&gt; emb [T, D]
+emb.cos(), emb.sin()                                     -&gt; [T, D], [T, D]
+</code></pre>
+<p><strong>骨架检查</strong>：<code>slice(1, 9, 3)</code> 选中 1, 4, 7（3 个 = s_h）；<code>slice(2, 9, 3)</code> 选中 2, 5, 8（3 个 = s_w）。</p>
+<p><strong>rotate_half / apply_rotary 验算</strong>：x = [1,2,3,4]，cos = [c0,c1,c0,c1]，sin = [s0,s1,s0,s1]，rotate_half(x) = [-3,-4,1,2]：
+<code>out[0] = 1·c0 − 3·s0 = −0.4161 − 2.7279 = −3.1440</code>，<code>out[2] = 3·c0 + 1·s0 = −1.2484 + 0.9093 = −0.3391</code>——正是二维旋转矩阵作用在 (x0, x2) 上。</p>
+<p><strong>最终检查清单</strong>：(1) bf16 下 rms_norm 先 cast 再乘 weight；(2) inv_freq 显式 fp32；(3) interleaved 用 <code>clone()</code> 再覆盖，切片终点 <code>3*section[axis]</code>；(4) chunked 的列区间是累积偏移；(5) <code>cat([f, f])</code> 而不是 <code>repeat_interleave</code>；(6) apply_rotary 插入 head 维并对齐 dtype。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>为什么 vllm-omni 在 CUDA 上要给 thinker 强制 <code>custom_ops: [&quot;+rotary_embedding&quot;]</code>？（编译后的 MRoPE 与 QK-norm 融合改变了音频输出）</li>
+<li>decode 阶段只有一个新 token，cos/sin 怎么高效地增量计算？</li>
+</ul>
+<p>对照源码：<code>deploy/qwen3_omni_moe.yaml:84-91</code> · <code>model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py:1694-1785</code> · HF <code>Qwen3OmniMoeThinkerTextRotaryEmbedding.apply_interleaved_mrope</code> · HF <code>Qwen3OmniMoeThinkerTextRMSNorm</code></p>
+<nav class="pager"><a class="next" href="m02_overview.html"><small>下一题 →</small>#2 · M02 Thinker Attention：QK-norm + GQA + KV cache</a></nav>
+</main>
+</body>
+</html>

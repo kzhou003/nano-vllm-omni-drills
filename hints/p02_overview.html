@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P02 提示 · Orchestrator v1：线性多 stage 路由</title>
+<meta name="description" content="你在写 vllm-omni 的大脑：三个 stage（thinker→talker→code2wav）各自吐输出，你要把它们正确串起来，并保证每个请求恰好结束一次。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="m08_overview.html">← <span class="lbl">M08</span></a><a href="p03_overview.html"><span class="lbl">P03</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#9 · Track A · 前端与 Orchestrator · 书 p.48</div>
+<h1>P02 · Orchestrator v1：线性多 stage 路由</h1>
+<p class="lede">你在写 vllm-omni 的大脑：三个 stage（thinker→talker→code2wav）各自吐输出，你要把它们正确串起来，并保证每个请求恰好结束一次。</p>
+<div class="badges">
+<span class="badge">⏱ <b>60 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p02_orchestrator.py</code></span>
+<span class="badge">验收 <code>./check.sh p02</code></span>
+<span class="badge">提示 <b>A-9</b> · 参考解 <b>C-9</b> <code>solutions/p02_orchestrator.py</code></span>
+<span class="badge"><a href="p02_flow.html">时序图 p02_flow</a></span><span class="badge"><a href="p02_vs_vllm_omni.html">源码对照</a></span>
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P02">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC · LIFE 工作表（P02 填好的）</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 1 的状态演化</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：API 进程里有一个 orchestrator 线程跑自己的 asyncio 事件循环，握着每个 stage 的 client（对端是 stage 子进程里的 EngineCore）。它要：接收前端提交的请求；读取每个 stage 的输出；决定输出是交给客户端、转发给下一个 stage，还是两者都做。</li>
+</ul>
+<pre><code>前端 add_request ─► [request handler] ─► stage0.submit
+stage0 / stage1 / stage2 的 get_output ─► reader×3 ─► ready_q ─► [dispatcher] ─► 输出给前端
+                                                                     └─► stage(s+1).submit
+</code></pre>
+<ul>
+<li><strong>需求</strong>：
+<ol>
+<li><strong>单写者</strong>：每个 stage 一个 reader task 只负责搬运；唯一的 dispatcher 修改请求状态。asyncio 协作式调度，只要不在“读-改-写”中间 await，就不需要锁。</li>
+<li><strong>先注册后提交</strong>：<code>request_states[rid]</code> 必须在第一次 <code>await stages[0].submit()</code> 之前就存在——submit 可能让出控制权，stage 可能很快吐出第一条输出。</li>
+<li><strong>转发</strong>：stage s 对某请求 finished=True，且 <code>s &lt; max(final_stage_ids)</code> 时，用 <code>forward_fn(s+1, prompt, stage s 的全部输出)</code> 构造下一个 stage 的输入并提交。</li>
+<li><strong>输出与终态</strong>：只有 final_stage_ids 里的 stage 的输出给客户端（Qwen3-Omni 是 {0: 文本, 2: 音频}）。每个请求<strong>恰好一条 finished=True，且是最后一条</strong>，条件是“所有 final stage 都完成”。</li>
+<li><strong>清理</strong>：发出终态后删除状态；之后到达的未知请求输出丢弃并计数（<code>dropped_outputs</code>）。</li>
+</ol>
+</li>
+</ul>
+<p><strong>验收要点</strong>：单请求 3 stage：stage0 文本与 stage2 音频都按序到达，唯一的 finished 是最后一条 · 30 个并发请求互不串扰、每个 stage 恰好收到每个请求一次 · 只有最后一个 stage 是 final 时 stage0 输出不泄露 · stage 在 submit() 内部就吐出第一条输出时不能丢 · 未知 request 的输出被丢弃计数、不会崩。</p>
+
+<div class="callout info"><div class="callout-title">交互图</div><p>完整时序（架构图 + 每一步谁在动）见 <strong><a href="p02_flow.html">p02_flow.html</a></strong>；与真实 vllm-omni 代码的逐项对照见 <strong><a href="p02_vs_vllm_omni.html">p02_vs_vllm_omni.html</a></strong>。</p>
+</div>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">工厂经理与秘书</div><p>dispatcher 是经理，只有他能改账本（<code>request_states</code>）；每部电话（stage）配一个秘书（reader）守着，响了就把内容抄成纸条（打上 sid）丢进经理的收件箱（<code>_ready_q</code>）。经理只盯收件箱，来一张处理一张。
+如果让经理自己轮流接电话（<code>for s in stages: await s.get_output()</code>），他会卡在一部永远不响的电话上：S1 要等 S0 的 &quot;there&quot; 被处理后才有任务，可 &quot;there&quot; 没人读——<strong>死锁</strong>。</p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC · LIFE 工作表（P02 填好的）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>问题</th>
+<th>P02</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>几个进程 / 线程 / 事件循环？</td>
+<td>题目已给定：orchestrator = 1 个事件循环；stage 是独立进程，但被 StageClient 包成 async 接口；<strong>不需要线程</strong></td>
+</tr>
+<tr>
+<td>S</td>
+<td>共享状态？谁写？</td>
+<td><code>request_states</code>（dispatcher 为主，handler 只负责注册）、<code>dropped_outputs</code>（dispatcher）</td>
+</tr>
+<tr>
+<td>B</td>
+<td>阻塞点？</td>
+<td>N 个 <code>get_output()</code>（互相独立、时间不可预测）、<code>_req_q.get()</code>、<code>_ready_q.get()</code>、<code>_out_q.get()</code></td>
+</tr>
+<tr>
+<td>W</td>
+<td>worker？</td>
+<td>reader × N（只搬运）、request_handler（注册 + submit 给 S0）、dispatcher（唯一决策者）</td>
+</tr>
+<tr>
+<td>C</td>
+<td>通道与消息格式</td>
+<td><code>_req_q: (&quot;add&quot;, rid, prompt)</code>；<code>_ready_q: (sid, list[StageOutput])</code>（fan-in）；<code>_out_q: OrchOutput</code></td>
+</tr>
+<tr>
+<td>L</td>
+<td>启停</td>
+<td>start：N+2 个 <code>create_task</code> 并保存；shutdown：cancel + <code>gather(return_exceptions=True)</code></td>
+</tr>
+<tr>
+<td>I</td>
+<td>公开 API</td>
+<td><code>add_request</code> 只 put；<code>next_output</code> 只 get（带 timeout）</td>
+</tr>
+<tr>
+<td>F</td>
+<td>不变量</td>
+<td>恰好一条终态且是最后一条；终态条件 final ⊆ finished；先注册再 submit；发给用户和转发是独立两件事；终态后清理</td>
+</tr>
+<tr>
+<td>E</td>
+<td>迟到 / 未知 / 异常</td>
+<td>未知 id 丢弃计数、不抛异常；清理之后再到的消息按未知处理</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>直接用 <code>o.finished</code> 当 <code>OrchOutput.finished</code>：用户收到两条 finished=True；若在第一条时就清理，S2 的所有输出都变成 dropped。</li>
+<li>每来一块就转发（而不是等 stage 完成）：S1 被同一请求 submit 多次，或 prev_data 不完整。</li>
+<li>清理后忘了 return，继续往下读已删除的状态（KeyError）或继续转发。</li>
+<li>先 submit 再注册：用户只看到 &quot;there&quot;，S1 收到 <code>[&quot;there&quot;]</code>，S2 只吐 &quot;wav:THERE&quot;，<code>dropped_outputs == 1</code>——不会卡死，数据静悄悄少了一块。</li>
+<li>未知 id 用 setdefault 之类“顺手”建状态：泄漏，还可能把孤儿输出发给用户。</li>
+<li>task 里抛出的异常不会自动打印，task 安静地死了，表现为 next_output 超时——调试时检查 <code>task.done() and task.exception()</code>。</li>
+</ul>
+<h2 id="s5">逐步图：例 1 的状态演化</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ final_stage_ids={0,2}，forward_fn 原样返回 prev_data，add_request(&quot;r1&quot;, &quot;hi there&quot;)</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. (request handler) add r1</div><p>注册 <code>ReqState</code>（无 await，不会被打断），<code>submitted = {0}</code>，然后 <code>await S0.submit(&quot;r1&quot;, &quot;hi there&quot;)</code>。</p>
+<p>stage_data = <code>{}</code>，finished = <code>{}</code></p>
+</div><div class="step" data-hl=""><div class="step-title">2. S0: (&quot;hi&quot;, fin=False)</div><p>stage_data = <code>{0: ['hi']}</code>，finished = <code>{}</code></p>
+<p>0 ∈ final → 发 <code>(0, 'hi', False)</code>；未完成，不转发。</p>
+</div><div class="step" data-hl=""><div class="step-title">3. S0: (&quot;there&quot;, fin=True)</div><p>stage_data = <code>{0: ['hi','there']}</code>，finished = <code>{0}</code></p>
+<p>0 ∈ final；<code>{0,2} ⊄ {0}</code> → 发 <code>(0, 'there', False)</code>（<strong>False！</strong>）</p>
+<p>0 完成且 0 &lt; 2 → <code>forward_fn(1, 'hi there', ['hi','there'])</code>，submitted = {0,1}，submit S1。</p>
+</div><div class="step" data-hl=""><div class="step-title">4. S1: ([&#x27;HI&#x27;,&#x27;THERE&#x27;], fin=True)</div><p>stage_data[1] = <code>[['HI','THERE']]</code>，finished = <code>{0,1}</code></p>
+<p>1 ∉ final → 不给用户；1 完成且 1 &lt; 2 → <code>forward_fn(2, …, [['HI','THERE']])</code>，submitted = {0,1,2}，submit S2。</p>
+</div><div class="step" data-hl=""><div class="step-title">5. S2: (&quot;wav:HI&quot;, fin=False)</div><p>stage_data[2] = <code>['wav:HI']</code>，发 <code>(2, 'wav:HI', False)</code>。</p>
+</div><div class="step" data-hl=""><div class="step-title">6. S2: (&quot;wav:THERE&quot;, fin=True)</div><p>finished = <code>{0,1,2}</code>，<code>{0,2} ⊆ finished</code> → 发 <code>(2, 'wav:THERE', True)</code>，<strong>清理，return</strong>（2 == last_stage，本来也不会转发）。</p>
+</div><div class="step" data-hl=""><div class="step-title">7. S2: (&quot;wav:LATE&quot;, fin=True)（假设迟到）</div><p>r1 已不在 request_states → <code>dropped_outputs += 1</code>，什么都不发。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1</strong>：S0→S1→S2，<code>final_stage_ids={0,2}</code>，<code>forward_fn = lambda nxt, prompt, prev: prev</code>。</p>
+<pre><code>await orch.add_request(&quot;r1&quot;, &quot;hi there&quot;)
+S0.submit(&quot;r1&quot;, &quot;hi there&quot;)          -&gt; S0 吐出 &quot;hi&quot;, &quot;there&quot;(finished)
+S1.submit(&quot;r1&quot;, [&quot;hi&quot;, &quot;there&quot;])     -&gt; S1 吐出 [&quot;HI&quot;,&quot;THERE&quot;](finished)（只有一块）
+S2.submit(&quot;r1&quot;, [[&quot;HI&quot;, &quot;THERE&quot;]])   -&gt; S2 吐出 &quot;wav:HI&quot;, &quot;wav:THERE&quot;(finished)
+</code></pre>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>stage_id</th>
+<th>data</th>
+<th>finished</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>0</td>
+<td>&quot;hi&quot;</td>
+<td>False</td>
+</tr>
+<tr>
+<td>2</td>
+<td>0</td>
+<td>&quot;there&quot;</td>
+<td>?（你来回答）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2</td>
+<td>&quot;wav:HI&quot;</td>
+<td>False</td>
+</tr>
+<tr>
+<td>4</td>
+<td>2</td>
+<td>&quot;wav:THERE&quot;</td>
+<td>True</td>
+</tr>
+</tbody>
+</table></div>
+<p>stage 1 的输出一条也不会出现在用户侧。结束后 <code>request_states == {}</code>，<code>dropped_outputs == 0</code>。</p>
+<p><strong>例 2</strong>：只有最后一个 stage 是 final（<code>final_stage_ids={2}</code>，prompt &quot;a b c&quot;）——用户只收到 <code>wav:A</code>(F)、<code>wav:B</code>(F)、<code>wav:C</code>(T)。S0 不是 final，但它的完成仍要触发向 S1 的转发——“给不给用户”和“要不要转发”是两件独立的事。</p>
+<p><strong>例 3</strong>：未知 request。add 之前 S1 先冒出 <code>StageOutput(&quot;ghost&quot;, &quot;?&quot;, True)</code>；正常跑完 r1；r1 终态之后 S2 又迟到 <code>StageOutput(&quot;r1&quot;, &quot;wav:LATE&quot;, True)</code>。结果：用户侧没有多余消息；<code>request_states == {}</code>；<code>dropped_outputs == 2</code>。</p>
+<h4>关键问题</h4>
+<ol>
+<li>S0 的最后一块 &quot;there&quot; 自带 finished=True。发给用户的那条 OrchOutput 的 finished 应该是什么？由什么决定？</li>
+<li>S0 的最后一块既要给用户，又要转发给 S1。两件事都做吗？先做哪件有关系吗？</li>
+<li>S2 拿到的输入为什么是 <code>[[&quot;HI&quot;,&quot;THERE&quot;]]</code> 而不是 <code>[&quot;HI&quot;,&quot;THERE&quot;]</code>？“stage s 产出的全部数据”是哪个列表？</li>
+<li>为什么必须在 <code>await stages[0].submit()</code> 之前把 ReqState 放进 request_states？</li>
+<li>请求清理之后又来一条它的输出，会发生什么？用 setdefault 顺手建 ReqState 会怎样？</li>
+<li>reader 为什么不自己处理输出，而要丢进 <code>_ready_q</code> 交给唯一 dispatcher？正确性靠什么保证？</li>
+<li><code>final_stage_ids={0}</code> 时 last_stage 是多少？S1、S2 会被 submit 吗？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li><code>StageOutput(request_id, data, finished)</code> 是 stage→orchestrator，<code>get_output()</code> 一次返回 <code>list[StageOutput]</code>（可能混着多个请求），<strong>没有 stage_id</strong>——哪个 stage 来的只有读它的 reader 知道。<code>OrchOutput(request_id, stage_id, data, finished, error)</code> 是 orchestrator→用户，只为 final stage 生成。</li>
+<li><code>last_stage = max(final_stage_ids)</code>：管线只需跑到最后一个 final stage。</li>
+<li>ReqState：<code>submitted</code> 已提交的 stage；<code>finished</code> 已报告完成的 stage；<code>stage_data[s]</code> stage s 的全部 data（按到达顺序）；<code>pending_final</code> P02 不用。</li>
+<li>三个队列：<code>_req_q</code>（add → handler）、<code>_ready_q</code>（readers → dispatcher）、<code>_out_q</code>（dispatcher → next_output）。<code>next_output(timeout=None)</code> 表示一直等。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><div class="table-wrap"><table>
+<thead>
+<tr>
+<th>task</th>
+<th>数量</th>
+<th>做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>_reader(sid, client)</code></td>
+<td>每个 stage 一个</td>
+<td>死循环 <code>await client.get_output()</code>，把 <code>(sid, batch)</code> 放进 <code>_ready_q</code>。只搬运，不碰状态</td>
+</tr>
+<tr>
+<td><code>_request_handler()</code></td>
+<td>1</td>
+<td>从 <code>_req_q</code> 取 add 消息，调用 <code>_handle_add</code></td>
+</tr>
+<tr>
+<td><code>_dispatcher()</code></td>
+<td>1</td>
+<td>从 <code>_ready_q</code> 取一批，按顺序对每条调用 <code>_handle_output(sid, o)</code></td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><code>shutdown()</code>：cancel 所有 task，再 <code>gather(..., return_exceptions=True)</code>（否则 “Task was destroyed but it is pending”）。</li>
+<li>reader 带上 sid：一个 stage 的输出经过“一个 reader → 一个 FIFO 队列 → 一个 dispatcher”，同一 stage 内顺序天然保持。</li>
+<li><strong><code>_handle_output</code> 的决策顺序</strong>（先写成注释再填代码）：① 查状态，没有就 drop 计数并返回；② 追加 <code>stage_data[sid]</code>；③ 若 o.finished，sid 加入 finished；④ 若 sid 是 final：算出请求级 done，发一条 OrchOutput；done 的话清理并立刻 return；⑤ 若 o.finished 且 sid &lt; last_stage：forward_fn 构造输入、标记 submitted、submit 给 sid+1。</li>
+<li><strong>先改状态再 await</strong>：dispatcher 里的 <code>await _out_q.put(...)</code> 和 <code>await stages[nxt].submit(...)</code> 都是让出点；在任何 await 之前把 stage_data / finished / submitted 更新好。</li>
+<li><strong>add 路径</strong>：<code>add_request</code> 只把 <code>(&quot;add&quot;, rid, prompt)</code> 放进 <code>_req_q</code>；真正的注册+提交在 handler 里做，注册排在第一个 await 之前。</li>
+<li>P03 会继承这个类并只覆盖 <code>_handle_add</code> / <code>_handle_output</code>——把三个循环和 cleanup 写成独立方法。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li><strong>False</strong>。OrchOutput.finished 是请求级的，条件 <code>final_stage_ids ⊆ st.finished</code>；此时 finished={0} 不含 2。只有 S2 最后一块那一刻条件首次成立，“恰好一条且最后一条”自动满足。</li>
+<li>都做。“sid ∈ final → 发给用户”和“o.finished 且 sid &lt; last_stage → 转发”是两个独立的 if，不是 if/elif。先发给用户更自然（用户的文本不必等 S1 提交完）；硬约束只有一个：如果这条已经是终态，发完就清理并 return，不能再转发。</li>
+<li><code>forward_fn(s+1, st.prompt, st.stage_data[s])</code>。stage_data[s] 是 dispatcher 每处理一条 stage s 输出就 append 一次攒出来的；S1 只吐了一块且这一块本身是 list，所以 S2 收到“一个元素的列表”。拆包/拼接是 forward_fn 的事，orchestrator 不关心 data 长什么样。</li>
+<li>await 交还控制权；stage 可能在 submit 里就把第一条输出放进通道，reader 和 dispatcher 随即运行——rid 还没注册就会被当成未知 id 丢掉。dict 赋值是同步的，放在 await 前就没有窗口。</li>
+<li>查不到 → <code>dropped_outputs += 1</code> → return。绝不能重建状态：重建的 ReqState 永远等不到终态（泄漏），还可能把孤儿输出发给用户。</li>
+<li>三个 reader 各自改状态会在各自的 await 点交错（两个都看到“还没 done”各发一条，或一个刚清理另一个又写入）。所有修改放进一个 task 串行执行，等价于一把全局锁却不用写锁。</li>
+<li>last_stage = 0，S0 完成就是终态，S1/S2 永远不会被 submit。</li>
+</ol>
+</div></details>
+<p><strong>骨架要点</strong>：<code>_handle_add</code> = 建 ReqState → 注册 → <code>submitted.add(0)</code> → <code>await stages[0].submit</code>；<code>_handle_output</code> 按 L2 的 ①–⑤；<code>_cleanup(rid)</code> = <code>request_states.pop(rid, None)</code>。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>如果 stage 有多个 replica，输出顺序还能保证吗？需要什么前提？（→ P04 的粘性绑定）</li>
+<li>输出队列为什么可以无界、请求队列为什么应该有界？</li>
+<li>把 dispatcher 换成每个请求一个 task 会怎样？好处与代价？</li>
+</ul>
+<p>对照源码：<code>engine/orchestrator.py:1099-1320</code> · <code>:1912-2046</code> · <code>:3062-3128</code> · <code>:232-271</code>（详见 <a href="p02_vs_vllm_omni.html">源码对照页</a>）</p>
+<nav class="pager"><a class="prev" href="m08_overview.html"><small>← 上一题</small>#8 · M08 串起来：tiny thinker 的 KV-cache greedy 解码</a><a class="next" href="p03_overview.html"><small>下一题 →</small>#10 · P03 Orchestrator v2：async_chunk 预热 + 终态守门</a></nav>
+</main>
+</body>
+</html>

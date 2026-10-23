@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P02 Orchestrator 时序图</title>
+<meta name="description" content="一步一步看例 1（S0→S1→S2，final={0,2}）里每个 worker 在做什么、消息走哪条通道、账本怎么变——再对比两个经典反例：先 submit 后注册、dispatcher 自己轮流等。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p02_overview.html">← <span class="lbl">P02 提示</span></a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero"><div class="kicker">#9 · P02 · 交互时序图</div><h1>P02 Orchestrator 时序图</h1><p class="lede">一步一步看例 1（S0→S1→S2，final={0,2}）里每个 worker 在做什么、消息走哪条通道、账本怎么变——再对比两个经典反例：先 submit 后注册、dispatcher 自己轮流等。</p></section><nav class="toc"><b>本页目录</b><ol><li><a href="#s1">架构图（SBWC 填完之后）</a></li><li><a href="#s2">反例 1：先 submit 后注册</a></li><li><a href="#s3">反例 2：dispatcher 自己轮流等（违反 B 原则）</a></li><li><a href="#s4">生命周期（L）</a></li></ol></nav><h2 id="s1">架构图（SBWC 填完之后）</h2>
+<p>橙色虚线 = 向 stage 提交（submit）；灰色实线 = 队列 put / get。只有 dispatcher 和（注册时的）request_handler 会碰账本 <code>request_states</code>。点下面“下一步”，图上正在动的部分会高亮。</p>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 例 1：add_request(&quot;r1&quot;, &quot;hi there&quot;) 的一生</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-diagram diagram"><svg viewBox="0 0 780 330" role="img" aria-label="P02 orchestrator 架构图">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="arrowhead" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+  <text x="12" y="16" font-size="12" class="muted-text">I · 公开 API</text>
+  <text x="150" y="16" font-size="12" class="muted-text">C · 通道</text>
+  <text x="270" y="16" font-size="12" class="muted-text">W · worker / S · 账本</text>
+  <text x="530" y="16" font-size="12" class="muted-text">W · reader</text>
+  <text x="660" y="16" font-size="12" class="muted-text">stage 进程（黑盒）</text>
+
+  <g class="node" data-node="add"><rect x="10" y="30" width="120" height="38" rx="8"/><text x="70" y="54" font-size="13" text-anchor="middle">add_request()</text></g>
+  <g class="node" data-node="req_q"><rect x="150" y="30" width="90" height="38" rx="8"/><text x="195" y="54" font-size="13" text-anchor="middle">_req_q</text></g>
+  <g class="node" data-node="handler"><rect x="265" y="30" width="140" height="38" rx="8"/><text x="335" y="54" font-size="13" text-anchor="middle">_request_handler</text></g>
+  <g class="node state" data-node="states"><rect x="265" y="135" width="140" height="44" rx="8"/><text x="335" y="155" font-size="13" text-anchor="middle">request_states</text><text x="335" y="171" font-size="11" text-anchor="middle" class="muted-text">账本（单写者）</text></g>
+  <g class="node" data-node="next"><rect x="10" y="262" width="120" height="38" rx="8"/><text x="70" y="286" font-size="13" text-anchor="middle">next_output()</text></g>
+  <g class="node" data-node="out_q"><rect x="150" y="262" width="90" height="38" rx="8"/><text x="195" y="286" font-size="13" text-anchor="middle">_out_q</text></g>
+  <g class="node" data-node="dispatcher"><rect x="265" y="262" width="140" height="38" rx="8"/><text x="335" y="286" font-size="13" text-anchor="middle">_dispatcher</text></g>
+  <g class="node" data-node="ready_q"><rect x="425" y="262" width="90" height="38" rx="8"/><text x="470" y="286" font-size="13" text-anchor="middle">_ready_q</text></g>
+
+  <g class="node" data-node="r0"><rect x="535" y="40" width="90" height="34" rx="8"/><text x="580" y="62" font-size="13" text-anchor="middle">reader 0</text></g>
+  <g class="node" data-node="r1"><rect x="535" y="120" width="90" height="34" rx="8"/><text x="580" y="142" font-size="13" text-anchor="middle">reader 1</text></g>
+  <g class="node" data-node="r2"><rect x="535" y="200" width="90" height="34" rx="8"/><text x="580" y="222" font-size="13" text-anchor="middle">reader 2</text></g>
+  <g class="node" data-node="s0"><rect x="665" y="40" width="105" height="34" rx="8"/><text x="717" y="62" font-size="13" text-anchor="middle">S0 thinker</text></g>
+  <g class="node" data-node="s1"><rect x="665" y="120" width="105" height="34" rx="8"/><text x="717" y="142" font-size="13" text-anchor="middle">S1 talker</text></g>
+  <g class="node" data-node="s2"><rect x="665" y="200" width="105" height="34" rx="8"/><text x="717" y="222" font-size="13" text-anchor="middle">S2 code2wav</text></g>
+
+  <path class="edge" data-node="e_add" d="M130,49 L148,49" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_req" d="M240,49 L263,49" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_reg" d="M335,68 L335,133" marker-end="url(#ah)"/>
+  <path class="edge submit" data-node="e_sub0" d="M405,40 C520,22 600,22 663,50" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_g0" d="M665,57 L627,57" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_g1" d="M665,137 L627,137" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_g2" d="M665,217 L627,217" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_p0" d="M560,74 L480,260" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_p1" d="M570,154 L490,260" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_p2" d="M575,234 L505,260" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_rd" d="M425,281 L407,281" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_st" d="M335,262 L335,181" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_out" d="M265,281 L242,281" marker-end="url(#ah)"/>
+  <path class="edge" data-node="e_next" d="M150,281 L132,281" marker-end="url(#ah)"/>
+  <path class="edge submit" data-node="e_sub1" d="M405,270 C470,200 560,160 663,145" marker-end="url(#ah)"/>
+  <path class="edge submit" data-node="e_sub2" d="M405,290 C500,320 620,280 663,226" marker-end="url(#ah)"/>
+</svg></div><div class="st-body"><div class="step" data-hl="add,e_add,req_q"><div class="step-title">1. 用户调用 add_request</div><p><code>add_request</code> 只做一件事：<code>await _req_q.put((&quot;add&quot;, &quot;r1&quot;, &quot;hi there&quot;))</code>。它不碰账本、不 submit——公开 API 要薄（I）。</p>
+</div><div class="step" data-hl="handler,e_req,e_reg,states,e_sub0,s0"><div class="step-title">2. handler 先注册，再 submit S0</div><p><code>_handle_add</code>：<code>request_states[&quot;r1&quot;] = ReqState(...)</code>、<code>submitted = {0}</code> ——<strong>全是同步代码，没有 await，不会被打断</strong>；然后才 <code>await S0.submit(&quot;r1&quot;, &quot;hi there&quot;)</code>。</p>
+<p>从这一刻起，无论 S0 多快吐输出、dispatcher 何时运行，都能查到 r1。</p>
+</div><div class="step" data-hl="s0,e_g0,r0,e_p0,ready_q"><div class="step-title">3. S0 吐出 &quot;hi&quot;，reader 0 搬运</div><p>reader 0 阻塞在 <code>S0.get_output()</code>，拿到 <code>[StageOutput(&quot;r1&quot;,&quot;hi&quot;,False)]</code>，打上 sid 放进 <code>_ready_q</code>：<code>(0, [..])</code>。reader <strong>不看内容、不碰账本</strong>。</p>
+</div><div class="step" data-hl="ready_q,e_rd,dispatcher,e_st,states,e_out,out_q"><div class="step-title">4. dispatcher 处理 &quot;hi&quot;</div><p><code>stage_data = {0: ['hi']}</code>；0 ∈ final → <code>done = {0,2} ⊆ {}</code> 为 False → put <code>OrchOutput(&quot;r1&quot;, 0, &quot;hi&quot;, False)</code>。S0 未完成，不转发。</p>
+</div><div class="step" data-hl="out_q,e_next,next"><div class="step-title">5. 用户拿到第一条</div><p><code>next_output()</code> = <code>wait_for(_out_q.get(), timeout)</code>：<code>(0, 'hi', False)</code>。</p>
+</div><div class="step" data-hl="s0,e_g0,r0,e_p0,ready_q,e_rd,dispatcher,states,out_q,e_out,e_sub1,s1"><div class="step-title">6. S0 吐出 &quot;there&quot;(fin) → 发给用户 + 转发 S1</div><p>finished = {0}，<code>{0,2} ⊄ {0}</code> → 发 <code>(0, 'there', False)</code>。</p>
+<p>同一条输出又满足 “o.finished 且 0 &lt; last_stage” → <code>forward_fn(1, prompt, ['hi','there'])</code>，<strong>先</strong> <code>submitted.add(1)</code> <strong>再</strong> <code>await S1.submit(...)</code>。两件事是两个独立的 if。</p>
+</div><div class="step" data-hl="s1,e_g1,r1,e_p1,ready_q,e_rd,dispatcher,states,e_sub2,s2"><div class="step-title">7. S1 完成 → 只转发，不给用户</div><p>S1 ∉ final：不发给用户。1 完成且 1 &lt; 2 → <code>forward_fn(2, …, [['HI','THERE']])</code> → submit S2。</p>
+</div><div class="step" data-hl="s2,e_g2,r2,e_p2,ready_q,e_rd,dispatcher,out_q,e_out,next,e_next"><div class="step-title">8. S2 吐出 &quot;wav:HI&quot;</div><p>发 <code>(2, 'wav:HI', False)</code>。</p>
+</div><div class="step" data-hl="s2,e_g2,r2,e_p2,ready_q,e_rd,dispatcher,e_st,states,out_q,e_out"><div class="step-title">9. S2 吐出 &quot;wav:THERE&quot;(fin) → 终态 + 清理</div><p>finished = {0,1,2} ⊇ {0,2} → 发 <code>(2, 'wav:THERE', True)</code> → <code>_cleanup(&quot;r1&quot;)</code> → <strong>return</strong>。账本里 r1 没了。</p>
+</div><div class="step" data-hl="s2,r2,ready_q,dispatcher,states"><div class="step-title">10. 迟到的 &quot;wav:LATE&quot;</div><p>dispatcher 查不到 r1 → <code>dropped_outputs += 1</code> → return。<strong>绝不复活状态</strong>。</p>
+</div></div></div>
+<h2 id="s2">反例 1：先 submit 后注册</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>顺序</th>
+<th>时间线</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>❌ 先 submit 后注册</td>
+<td><code>await submit()</code> 交出控制权 → S0 很快吐出 &quot;hi&quot; → reader 搬进 <code>_ready_q</code> → dispatcher 查 request_states：查不到 r1 → 当成未知请求丢弃 → 回到 handler，这时才注册</td>
+<td>用户永远收不到 &quot;hi&quot;，<code>dropped_outputs = 1</code></td>
+</tr>
+<tr>
+<td>✅ 先注册后 submit</td>
+<td>注册（无 await，不会被打断）→ <code>await submit()</code> → 之后无论谁先跑，dispatcher 都能查到 r1</td>
+<td>正确</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s3">反例 2：dispatcher 自己轮流等（违反 B 原则）</h2>
+<pre><code class="language-python">while True:
+    for sid, client in enumerate(self.stages):
+        outs = await client.get_output()     # ← 一次只能等一个
+        ...
+</code></pre>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>dispatcher 在做什么</th>
+<th>S0</th>
+<th>S1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>t1</td>
+<td><code>await S0.get_output()</code>，拿到 &quot;hi&quot;</td>
+<td>已吐出 &quot;hi&quot;</td>
+<td>还没有任务</td>
+</tr>
+<tr>
+<td>t2</td>
+<td><code>await S1.get_output()</code></td>
+<td>&quot;there&quot; 已吐出，没人读</td>
+<td>没有任务，永远不会有输出</td>
+</tr>
+<tr>
+<td>t3…</td>
+<td>一直卡在 S1</td>
+<td>还在等</td>
+<td>S1 的任务要等 S0 的 &quot;there&quot; 被处理后才会提交，可 &quot;there&quot; 没人读</td>
+</tr>
+</tbody>
+</table></div>
+<p>结果是<strong>死锁</strong>：dispatcher 等 S1，S1 等 dispatcher 转发，而转发需要先读到 S0 的 &quot;there&quot;。规则：<strong>每个独立的阻塞源配一个专门守着它的 worker</strong>。</p>
+<h2 id="s4">生命周期（L）</h2>
+<pre><code class="language-python">async def start(self):
+    for sid, client in enumerate(self.stages):          # 每个阻塞源一个 worker（B → W）
+        self._tasks.append(asyncio.create_task(self._reader(sid, client)))
+    self._tasks.append(asyncio.create_task(self._request_handler()))
+    self._tasks.append(asyncio.create_task(self._dispatcher()))
+
+async def shutdown(self):
+    for t in self._tasks:
+        t.cancel()                                       # 在各自的 await 处抛 CancelledError
+    await asyncio.gather(*self._tasks, return_exceptions=True)   # 等它们真正结束
+</code></pre>
+<p>常见坑：① 不保存 task 引用 → 可能被 GC，shutdown 也找不到；② 只 cancel 不 gather → “Task was destroyed but it is pending”；③ start() 里 await 了永远不返回的东西。</p>
+
+</main>
+</body>
+</html>

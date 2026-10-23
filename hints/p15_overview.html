@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P15 提示 · Thinker→Talker 输入构造（含“差一行”）</title>
+<meta name="description" content="vLLM 先把 stop token 追加到输出再判停，所以 thinker 的 hidden 会多一行；talker 吃进去，音频末尾就多出杂音——这就是“差一行”。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p13_overview.html">← <span class="lbl">P13</span></a><a href="p14_overview.html"><span class="lbl">P14</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#22 · Track D · 模型胶水（纯函数） · 书 p.96</div>
+<h1>P15 · Thinker→Talker 输入构造（含“差一行”）</h1>
+<p class="lede">vLLM 先把 stop token 追加到输出再判停，所以 thinker 的 hidden 会多一行；talker 吃进去，音频末尾就多出杂音——这就是“差一行”。</p>
+<div class="badges">
+<span class="badge">⏱ <b>40 min</b></span>
+<span class="badge diff-易">难度 <b>易</b></span>
+<span class="badge">实现 <code>mine/p15_talker_inputs.py</code></span>
+<span class="badge">验收 <code>./check.sh p15</code></span>
+<span class="badge">提示 <b>A-22</b> · 参考解 <b>C-22</b> <code>solutions/p15_talker_inputs.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P15">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：trim 的推导（例 1）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：非流式（full payload）模式下，thinker 结束时把累积的 hidden 发给 talker（Qwen2.5-Omni 布局，Qwen3-Omni 类似）。talker 的 prompt = thinker 的 prompt 部分 + 两个特殊位置，之后每个 decode 步消费一行 thinker 回复向量。</li>
+<li><strong>“差一行”</strong>：</li>
+</ul>
+<pre><code>prompt: P 个 token，生成: [a, b, &lt;stop&gt;]
+vLLM 采样出 &lt;stop&gt; → 先追加到 output → 再检查 stop → FINISHED_STOPPED
+累积的 hidden 行数 = P + 3（包含 &lt;stop&gt; 那一步）
+talker 应该只消费 a、b 两行 → 去掉最后一行，并从 output_ids 里去掉 stop id
+finish_reason = &quot;length&quot;（到达 max_tokens）时没有多余行，全部保留
+</code></pre>
+<ul>
+<li><strong>talker prefill 布局（Qwen2.5-Omni）</strong>：</li>
+</ul>
+<pre><code>embeds = [prompt_embeds (P 行)] + [spk_embed + codec_pad_embed] + [first_reply + codec_bos_embed]
+ids    = [mask_id] * P + [pad_id, start_id]                  # 共 P + 2 个位置
+decode: input_k = reply_queue[k] + embed(上一步采样的 codec)；回复向量用完后用 fallback（tts_pad）
+</code></pre>
+<p>特殊 id 来自 config，这里通过参数传入。</p>
+<p><strong>验收要点</strong>：stop 结束：去掉一行与 stop id · length 结束：全部保留 · prefill 行数不足时报错 · talker prefill 的 ids/embeds 布局 · decode 每步消费一行，耗尽后用 fallback。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">录音机的“咔哒”声</div><p>你说完后伸手按停止键——录音机先录下了按键的“咔哒”声才停。播放前得把结尾那下咔哒剪掉（finish=&quot;stop&quot; → drop 1）。如果是磁带用完自动停的（finish=&quot;length&quot;），最后一个字是你真正说的话，一个字都不能剪。还有：磁带后面多出一截空白（多捕获的行），正确的剪法是“只保留应该有的长度”，而不是“永远剪掉最后一秒”——否则空白被剪了，咔哒声还在。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">座位表：P 个普通座 + 两个特殊座</div><p>talker 的 prefill 有 P + 2 个座位。前 P 个坐 prompt 的每一行（名牌统一写 mask_id——talker 只看人本身，即 embedding）。第 P 号是“主持人席”：说话人 + codec pad，名牌 pad_id；第 P+1 号是“开场席”：回复第一行 + codec bos，名牌 start_id——talker 从这里开始说出第一帧 codec。之后每个 decode 步回复的下一行“上台”一次；人都上完了，由替补（fallback）一直顶上。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<p>例子：P = 3，output 4 个（含 stop），R = 8，D = 2。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>张量 / 量</th>
+<th>形状</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>hidden</td>
+<td><code>[8, 2]</code></td>
+<td>prefill 3 行 + 每个 decode 步 1 行（含 stop 那步）+ 1 行多捕获</td>
+</tr>
+<tr>
+<td>2</td>
+<td>P，检查 R ≥ P</td>
+<td>标量</td>
+<td>P = 3；8 ≥ 3，继续（否则 ValueError）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>drop、应有行数</td>
+<td>标量</td>
+<td>stop 且有输出 → drop = 1；3 + 4 − 1 = 6</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>rows = hidden[:6]</code></td>
+<td><code>[6, 2]</code></td>
+<td>行 6（stop）和行 7（多余）都被截掉</td>
+</tr>
+<tr>
+<td>5</td>
+<td>prefill / decode</td>
+<td><code>[3, 2]</code> / <code>[3, 2]</code></td>
+<td>按 P 切开；decode 行数 == 新的 len(output_ids) = 3</td>
+</tr>
+<tr>
+<td>6</td>
+<td>spk+pad、first_reply+bos</td>
+<td><code>[2]</code> → <code>[1, 2]</code></td>
+<td>1-D 向量先变成一行才能和 <code>[P, D]</code> 沿 dim 0 拼接</td>
+</tr>
+<tr>
+<td>7</td>
+<td>embeds / ids</td>
+<td><code>[5, 2]</code> / 5 个</td>
+<td>P + 2 个位置，ids 与 embeds 一一对应</td>
+</tr>
+<tr>
+<td>8</td>
+<td>reply_queue</td>
+<td><code>[2, 2]</code> → <code>[1, 2]</code> → <code>[0, 2]</code></td>
+<td>每步取队头一行；空了之后用 fallback，队列保持 <code>[0, 2]</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>用 <code>hidden[:-1]</code> 去掉 stop 行：多捕获了行时砍掉的是多余行，stop 行还在。</li>
+<li>finish=&quot;length&quot; 也 drop：把真正的最后一个字丢掉。</li>
+<li>stop 但 output_ids 为空：没有“stop 那一行”可丢；硬 drop 会切掉一行 prompt。</li>
+<li>先切片后检查：切片越界不报错，只悄悄返回短 tensor；R &lt; P 的检查要放最前面。</li>
+<li>原地修改调用方的 output_ids：调用方可能还要拿它 detokenize；返回新 list。</li>
+<li><code>[D]</code> vs <code>[1, D]</code>：直接 cat 1-D 向量会报维度错；别把 <code>(ids, embeds)</code> 返回顺序写反。</li>
+<li>队列空时返回 None：调用方下一步还要拿它；应原样返回 <code>[0, D]</code> 的空队列。</li>
+</ul>
+<h2 id="s5">逐步图：trim 的推导（例 1）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ prompt_ids=[11,12,13,14]（P=4），output_ids=[21, 22, 151645]，hidden 7 行（第 r 行 = [r, r]），finish=&quot;stop&quot;</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 检查</div><p><code>hidden.shape[0] &lt; P</code>？7 &lt; 4 → 否，继续。</p>
+<p>hidden 行：<span class="cells"><span class="cell t">0</span><span class="cell t">1</span><span class="cell t">2</span><span class="cell t">3</span><span class="cell h">4</span><span class="cell h">5</span><span class="cell bad">6</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">2. drop 与 target</div><p>finish == &quot;stop&quot; 且 output 非空 → drop = 1；target = 4 + 3 − 1 = <strong>6</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">3. 截断与切分</div><p>rows = hidden[:6] → prefill = 行 0..3，decode = 行 4, 5（第 6 行属于 stop token，丢掉）</p>
+<p><span class="cells"><span class="cell t">0</span><span class="cell t">1</span><span class="cell t">2</span><span class="cell t">3</span><span class="cell h">4</span><span class="cell h">5</span><span class="cell off">6</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">4. output_ids</div><p><code>[21, 22, 151645][:3−1] = [21, 22]</code>（新 list）</p>
+</div><div class="step" data-hl=""><div class="step-title">5. 对比：length 结束 + 多捕获</div><p>prompt [11, 12]（P=2），output [5, 6]，hidden 5 行，finish=&quot;length&quot; → target = 4：prefill 行 0,1、decode 行 2,3，第 4 行超出 target 不要。</p>
+<p><span class="cells"><span class="cell t">0</span><span class="cell t">1</span><span class="cell h">2</span><span class="cell h">3</span><span class="cell off">4</span></span></p>
+<p><code>prompt_ids=[1,2,3,4]</code>（P=4）而 hidden 只有 3 行 → ValueError。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>例 1、例 2 见逐步图。</p>
+<p><strong>例 3：prefill 布局与 decode 消费</strong>（D=2）：</p>
+<pre><code>prompt_embeds = [[1,2],[3,4]]   first_reply = [0.5,0.5]
+spk = [10,20]   codec_pad = [1,1]   codec_bos = [100,200]
+mask_id=7, pad_id=5, start_id=6
+ids    = [7, 7, 5, 6]
+embeds = [[1,2], [3,4], [11,21], [100.5,200.5]]       # [P+2, D] = [4, 2]
+</code></pre>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>step</th>
+<th>last_codec_embed</th>
+<th>输出 input</th>
+<th>剩余 queue 行数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>[0.1,0.2]</td>
+<td>[1.1, 1.2]</td>
+<td>1</td>
+</tr>
+<tr>
+<td>2</td>
+<td>[0.3,0.4]</td>
+<td>[2.3, 2.4]</td>
+<td>0</td>
+</tr>
+<tr>
+<td>3</td>
+<td>[0.5,0.6]</td>
+<td>[-8.5, -8.4]</td>
+<td>0 ← 用 fallback</td>
+</tr>
+<tr>
+<td>4</td>
+<td>[0.7,0.8]</td>
+<td>[-8.3, -8.2]</td>
+<td>0 ← 一直 fallback</td>
+</tr>
+</tbody>
+</table></div>
+<p>（reply_queue = [[1,1],[2,2]]，fallback = [-9,-9]）</p>
+<h4>关键问题</h4>
+<ol>
+<li>为什么 stop 结束的请求 hidden 行数会比 talker 真正需要的多一行？这一行对应哪个 token 的 forward？</li>
+<li>finish_reason == &quot;length&quot; 时最后一个生成 token 是正常内容还是 stop token？要不要丢？</li>
+<li>prefill 和 decode 的分界点由什么决定：hidden 的行数，还是 len(prompt_ids)？</li>
+<li>hidden 行数 &gt; target，多出的行怎么处理？&lt; P 呢？为什么处理方式不一样？</li>
+<li>talker prefill 最后两个位置的 embedding 各是哪两个向量相加？对应的 id 是什么？</li>
+<li>first_reply 已在 prefill 里用掉，那 decode 时 reply_queue 的第一行应该是第几个生成 token 的行？</li>
+<li>talker_decode_input 在 queue 为空时返回的“剩余 queue”是什么形状？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li><code>target = P + len(output_ids) − drop</code>：它是“talker 应当看到的总行数”，而不是 <code>hidden.shape[0] − drop</code>。</li>
+<li>mask_id / pad_id / start_id 是 talker（codec）词表里的特殊 id；prompt 部分统一填 mask_id，模型只看 embedding。</li>
+<li>decode 输入 = 文本侧（thinker 回复向量）+ 音频侧（上一步 codec id 的 embedding）；文本用完后换成 fallback（真实系统里是 tts_pad 的 embedding）。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li>拆成三个纯函数：trim 只做切片与边界检查；prefill 只做 cat；decode 只做“取头 + 相加”。每个 3–8 行。</li>
+<li><strong>trim 的顺序</strong>：① 先算 P 并检查 <code>hidden.shape[0] &lt; P</code> → ValueError；② 算 drop；③ 算 target 并截断 rows；④ 按 P 切成 prefill / decode；⑤ output_ids 去尾。</li>
+<li><strong>边界</strong>：stop 但 output_ids 为空——只在 output_ids 非空时 drop。</li>
+<li><strong>prefill 拼接</strong>：一次 <code>torch.cat</code> 三块（<code>[P,D]</code>、<code>[1,D]</code>、<code>[1,D]</code>），dim=0；ids 用 list 乘法再拼两个特殊 id；返回 <code>(ids, embeds)</code>。</li>
+<li><strong>decode 的剩余 queue</strong>：有行时返回 <code>queue[1:]</code>（K=1 时是 <code>[0, D]</code>）；空时原样返回空 queue。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>stop token 被采样出来后先 append 再判停，它那一步的 hidden 已经被累积；这一行是“产生 stop token 的那次 forward 之后”记录的行，不属于回复内容。</li>
+<li>普通内容（只是到了 max_tokens），全部保留，drop=0。</li>
+<li>分界点是 <code>P = len(prompt_ids)</code>；hidden 行数只用于检查和截断。</li>
+<li>
+<blockquote>
+<p>target：截断到 target，静默丢弃；&lt; P：连 prompt 都不完整，prefill 无法构造，必须报错。介于 P 和 target 之间：按切片自然得到较短的 decode（spec 不要求报错）。</p>
+</blockquote>
+</li>
+<li>倒数第二位：<code>spk_embed + codec_pad_embed</code>，id = pad_id；最后一位：<code>first_reply + codec_bos_embed</code>，id = start_id。</li>
+<li>一般从第 2 个生成 token 开始（第 1 个已作为 first_reply 进 prefill）；这个函数本身不关心，只取 queue 头。</li>
+<li>原来的空 queue，形状 <code>[0, D]</code>。</li>
+</ol>
+</div></details>
+<p><strong>自检</strong>：① 例 2 的 5 行 hidden 下 decode 是否恰好 2 行；② build_talker_prefill 返回的 embeds 前 P 行与 prompt_embeds 完全相等；③ decode 第 3 步起一直用 fallback，queue 形状保持 <code>[0, D]</code>。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>async_chunk 模式下 chunk 0 应该带哪些东西？之后的 chunk 呢？</li>
+</ul>
+<p>对照源码：<code>model_executor/stage_input_processors/qwen2_5_omni.py:261-317</code> · <code>model_executor/models/qwen2_5_omni/qwen2_5_omni.py:760-847</code> · <code>model_executor/stage_input_processors/qwen3_omni.py:409-542</code></p>
+<nav class="pager"><a class="prev" href="p13_overview.html"><small>← 上一题</small>#21 · P13 ChunkAdapter：后台收发线程与顺序/清理语义</a><a class="next" href="p14_overview.html"><small>下一题 →</small>#23 · P14 Codec 窗口规划：首块小、后块大、左上下文</a></nav>
+</main>
+</body>
+</html>

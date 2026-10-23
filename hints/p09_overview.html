@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P09 提示 · Paged KV 写入 + decode attention（参考实现）</title>
+<meta name="description" content="先用 PyTorch 写出正确的 paged KV 写入与 decode attention 参考实现——它就是之后 Triton kernel 的对拍标准。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p08_overview.html">← <span class="lbl">P08</span></a><a href="p12_overview.html"><span class="lbl">P12</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#19 · Track B · Stage 进程与调度 · 书 p.84</div>
+<h1>P09 · Paged KV 写入 + decode attention（参考实现）</h1>
+<p class="lede">先用 PyTorch 写出正确的 paged KV 写入与 decode attention 参考实现——它就是之后 Triton kernel 的对拍标准。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p09_paged_attention.py</code></span>
+<span class="badge">验收 <code>./check.sh p09</code></span>
+<span class="badge">提示 <b>A-19</b> · 参考解 <b>C-19</b> <code>solutions/p09_paged_attention.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P09">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 2 序列 0 的 gather</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：P06 决定每个 token 的 K/V 存在哪个物理 slot。model runner 每步：先按 slot_mapping 把新 token 的 K/V 写进 cache，再让 attention 按 block_tables 去 cache 里读历史。</li>
+</ul>
+<pre><code>cache 布局:   [num_blocks, block_size, num_kv_heads, head_dim]
+写:           cache[slot // bs, slot % bs] = k[i]          （slot = -1 是 padding，不写）
+decode 读:    序列 b 的前 context_lens[b] 个 token：
+              k_b = cache[block_tables[b, :ceil(n/bs)]].reshape(-1, KVH, D)[:n]
+              out_b = softmax(q_b · k_bᵀ · scale) · v_b    （GQA：head h 用 kv head h // (H/KVH)）
+</code></pre>
+<ul>
+<li><strong>易错点（题面）</strong>：物理块不连续（测试会打乱分配）；block table 尾部未用的位置是垃圾值，不能读；CUDA graph 模式下 batch 会被 pad，pad 出来的 token 的 slot 是 -1；softmax 用 fp32。</li>
+</ul>
+<p><strong>验收要点</strong>：与 dense attention 数值一致（GQA、非连续物理块、block table 尾部是垃圾值）· slot -1 的 padding token 不写入 · 随机形状与 block_size。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">储物柜墙：slot 就是柜号</div><p>KV cache 是一面储物柜墙：num_blocks 组、每组 block_size 格。<code>slot = 组号 × 每组格数 + 格号</code>，所以“展平后的第 slot 格”和 <code>cache[slot // bs, slot % bs]</code> 是同一个位置。一个序列拿到的是一张取件码清单（block table），组号乱序、不连号都没问题。最危险的是 <code>slot = -1</code>：Python/PyTorch 里 -1 表示“最后一格”，于是本该丢掉的 padding token 会安静地覆盖掉最后一格里别人的包裹——不报错、不告警。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">图书馆的索书单</div><p>block table 是印好格子的索书单（固定 max_blocks 行），你只填了前两行，后面是上一个读者留下的乱码——照着去取书，轻则取到别人的书（结果悄悄错），重则架号不存在（IndexError）。最后一卷只看前几页：“反正那两页是空白”这种侥幸不成立——空白页的 score = 0，在 softmax 里仍占一份权重（e⁰ = 1），只有截断（或置 -inf）才真正排除它。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<p><strong>write_kv</strong>（可以整批向量化）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>张量 / 形状</th>
+<th>做什么</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>slot_mapping <code>[T]</code></td>
+<td><code>keep = slot_mapping &gt;= 0</code></td>
+<td>没过滤 -1：padding 覆盖最后一个 slot，不报错</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>s = slot_mapping[keep]</code> <code>[T']</code></td>
+<td><code>blk = s // bs</code>、<code>off = s % bs</code></td>
+<td>int32 索引在某些后端不被接受，转 long</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>k[keep]</code> <code>[T', KVH, D]</code></td>
+<td><code>k_cache[blk, off] = k[keep]</code>（v 同理）</td>
+<td>写成 <code>k_cache[blk][off]</code> 会先复制一份再写，改不到原 cache</td>
+</tr>
+<tr>
+<td>4</td>
+<td>—</td>
+<td>返回 None（原地）</td>
+<td>返回新张量 → 调用方拿不到写入结果</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>paged_decode_attention</strong>（逐序列循环即可，先写对）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>张量 / 形状</th>
+<th>做什么</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>n = int(context_lens[b])</code></td>
+<td><code>nb = ceil(n / bs)</code></td>
+<td>用 <code>n // bs</code> → 最后一个不满的块被整块丢掉</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>tbl = block_tables[b, :nb].long()</code></td>
+<td>只取有效项</td>
+<td>取整行 → 读垃圾值：IndexError 或别人的 KV</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>k_cache[tbl]</code> <code>[nb, bs, KVH, D]</code></td>
+<td>按 table 的顺序 gather，逻辑顺序自动正确</td>
+<td>以为要先排序 table——不行，table 的顺序就是逻辑顺序</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>.reshape(nb*bs, KVH, D)[:n]</code></td>
+<td>展平成 token 维，截掉最后一块多出来的位置</td>
+<td>不截断 → 多看几个位置，结果悄悄错</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>.repeat_interleave(H // KVH, dim=1)</code> → <code>[n, H, D]</code></td>
+<td>GQA</td>
+<td>用 repeat → <code>h % KVH</code>；KVH=1 时两者相同，很难发现</td>
+</tr>
+<tr>
+<td>6</td>
+<td>scores <code>[H, n]</code> fp32</td>
+<td><code>einsum(&quot;hd,nhd-&gt;hn&quot;, q[b].float(), kb) * scale</code>，在 n 维 softmax</td>
+<td>scale 乘在 softmax 之后；在 bf16 里做 softmax</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>out[b]</code> <code>[H, D]</code></td>
+<td><code>einsum(&quot;hn,nhd-&gt;hd&quot;, probs, vb).to(q.dtype)</code></td>
+<td>忘了转回 q.dtype；head 维和 token 维搞混</td>
+</tr>
+</tbody>
+</table></div>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>不变量</th>
+<th>怎么验</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>I1 -1 的 slot 对应的值不出现在 cache 的任何位置</td>
+<td>写一个所有元素都是哨兵值（如 9.0）的 padding token，写完 <code>assert (cache == 9).sum() == 0</code></td>
+</tr>
+<tr>
+<td>I2 只访问 <code>block_tables[b, :ceil(n/bs)]</code></td>
+<td>把 table 尾部填成 99999，正确实现不报错</td>
+</tr>
+<tr>
+<td>I3 参与 attention 的 K/V 行数恰好 == context_lens[b]</td>
+<td><code>assert kb.shape[0] == n</code>，并用 n 不是 bs 倍数的长度专门测</td>
+</tr>
+<tr>
+<td>I4 与 dense attention 数值一致</td>
+<td>随机长度（含 1、bs 的倍数、非倍数）、打乱物理块、尾部填垃圾值对拍</td>
+</tr>
+<tr>
+<td>I5 GQA：head h 用 kv head h // group</td>
+<td>H=4, KVH=2：repeat_interleave 得 [0,0,1,1]，repeat 得 [0,1,0,1]</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>bug</th>
+<th>症状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>没过滤 slot -1</td>
+<td>最后一个物理块的最后一个 slot 被 padding 覆盖，长序列结果偶发错误</td>
+</tr>
+<tr>
+<td>读了 table 的整行</td>
+<td>IndexError（垃圾值越界），或读到别人的 KV</td>
+</tr>
+<tr>
+<td>没截掉最后一块的多余位置</td>
+<td>上下文长度不是 bs 整数倍的序列结果错</td>
+</tr>
+<tr>
+<td>GQA 用 repeat 而不是 repeat_interleave</td>
+<td>num_kv_heads=1 时正确、&gt;1 时错——很隐蔽</td>
+</tr>
+<tr>
+<td>block_tables 是 int32 直接索引</td>
+<td>新版 PyTorch CPU 上能用，旧版本 / 某些后端不支持；转 long 最稳</td>
+</tr>
+<tr>
+<td>softmax 在 bf16 中做</td>
+<td>与 fp32 参考有 1e-2 量级偏差</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s5">逐步图：例 2 序列 0 的 gather</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ block_size=2, num_blocks=4, KVH=1, H=2, D=2, scale=1；序列 0 有 3 个 token，物理块 [2, 0]</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 写入</div><p>K0 = [[1,0], [0,1], [1,1]]、V0 = [[1,2], [3,4], [5,6]] 写入 slot [4, 5, 0]：</p>
+<p>物理块：块0 = <span class="cells"><span class="cell t">[1,1]</span><span class="cell gap">·</span></span> 块1 = <span class="cells"><span class="cell gap">·</span><span class="cell gap">·</span></span> 块2 = <span class="cells"><span class="cell t">[1,0]</span><span class="cell t">[0,1]</span></span> 块3 = <span class="cells"><span class="cell h">[2,2]</span><span class="cell gap">·</span></span>（块3 是序列 1）</p>
+<p>block_tables = <code>[[2, 0], [3, 77]]</code>——77 是垃圾值（甚至超出 num_blocks）</p>
+</div><div class="step" data-hl=""><div class="step-title">2. n 与 nb</div><p>n = context_lens[0] = 3</p>
+
+<details class="answer"><summary>nb = ? table = ?</summary><div class="body"><p>nb = ceil(3/2) = 2；table = block_tables[0, :2] = [2, 0]</p>
+</div></details></div><div class="step" data-hl=""><div class="step-title">3. gather + reshape</div><p><code>k_cache[table]</code> 形状 <code>[2, 2, 1, 2]</code> → reshape 后（逻辑位置 0..3）：</p>
+<p><span class="cells"><span class="cell t">[1,0]</span><span class="cell t">[0,1]</span><span class="cell t">[1,1]</span><span class="cell bad">[0,0]</span></span></p>
+<p>第 4 个位置是块 0 offset 1——未写入的 0 向量，<strong>不属于该序列</strong>。不截断的话它的 score 是 0 而不是 -inf，会被分到注意力。</p>
+</div><div class="step" data-hl=""><div class="step-title">4. 截断到前 n 个</div><p><span class="cells"><span class="cell t">[1,0]</span><span class="cell t">[0,1]</span><span class="cell t">[1,1]</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">5. head0：q = [1, 0]</div><p>scores = q·Kᵀ × 1.0 = [1, 0, 1] → softmax = [0.4223, 0.1554, 0.4223] → out = [3.0, 4.0]</p>
+<p>head1：q = [0, 2] → scores [0, 2, 2] → [0.0634, 0.4683, 0.4683] → [3.8099, 4.8099]</p>
+</div><div class="step" data-hl=""><div class="step-title">6. 序列 1：只有 1 个 token</div><p>nb = 1，table = [3]（不读 77）。无论 q 是什么输出都是 V1 = [7, 8]。</p>
+<p>结果：<code>[[[3.0, 4.0], [3.8099, 4.8099]], [[7.0, 8.0], [7.0, 8.0]]]</code></p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1：write_kv 与 padding</strong>（cache 形状 <code>[3, 2, 1, 1]</code>，初始全 0）：</p>
+<pre><code class="language-python">k = [[[10.]], [[20.]], [[30.]], [[40.]]]          # [4, 1, 1]
+v = k * 0.1
+slot_mapping = tensor([4, 5, -1, 1])
+write_kv(k_cache, v_cache, k, v, slot_mapping)
+k_cache[:, :, 0, 0]  # -&gt; [[ 0., 40.],    块0: offset1 &lt;- token3 (slot 1)
+                     #     [ 0.,  0.],    块1: 没人写
+                     #     [10., 20.]]    块2: slot 4,5 &lt;- token0, token1
+v_cache[:, :, 0, 0]  # -&gt; [[0., 4.], [0., 0.], [1., 2.]]
+</code></pre>
+<p>token2 的 slot 是 -1，30 不能出现在 cache 的任何位置——特别是最后一个 slot（块2 offset1）。</p>
+<p><strong>例 2</strong>：见逐步图。<strong>例 3：GQA 映射</strong>（H=8, KVH=2, group=4）：正确 <code>h // group</code> = 0 0 0 0 1 1 1 1；错误 <code>h % KVH</code> = 0 1 0 1 0 1 0 1。</p>
+<h4>关键问题</h4>
+<ol>
+<li>slot 7、block_size 4 对应哪个物理块、哪个 offset？cache 用 <code>view(-1, KVH, D)</code> 展平后 slot 和第一维下标什么关系？</li>
+<li>直接 <code>k_cache.view(-1, KVH, D)[slot_mapping] = k</code>，slot -1 会写到哪里？会报错吗？</li>
+<li>context_len = 5、block_size = 4：table 前几项有效？取出后一共几个 token 位置、要截掉几个？</li>
+<li>block_tables 的 dtype 是什么？能直接用作高级索引吗？</li>
+<li>GQA 下 repeat_interleave 和 repeat 哪个与 <code>h // (H // KVH)</code> 匹配？</li>
+<li>“Softmax in fp32”：哪些张量转 fp32？输出最终什么 dtype？</li>
+<li>scale 乘在哪一步？乘在 softmax 之后会怎样？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>前两维合起来就是“slot”维：<code>cache[slot // bs, slot % bs]</code> 与 <code>cache_flat[slot]</code> 同一位置。</li>
+<li>block_tables 是 padding 成 <code>[B, max_blocks]</code> 的矩形，序列 b 只有前 <code>ceil(context_lens[b] / bs)</code> 项有意义。</li>
+<li>decode 阶段每个序列只有最新的 1 个 query，它可以看见全部 context（包括自己，已先 write_kv 写进去），不需要 causal mask。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>write_kv（向量化）</strong>：<code>valid = slot_mapping &gt;= 0</code> → 取有效 slot 与 k/v 行 → <code>blocks = slots // bs, offs = slots % bs</code> → <code>k_cache[blocks, offs] = k[valid]</code>。原地写，返回 None。</li>
+<li><strong>decode（先写循环版）</strong>：对每个 b：n、<code>nb = ceil(n / bs)</code>、<code>table = block_tables[b, :nb].long()</code>。</li>
+<li><strong>gather + reshape + 截断</strong>：<code>k_cache[table]</code> <code>[nb, bs, KVH, D]</code> → reshape <code>[nb*bs, KVH, D]</code> → 取前 n 行。</li>
+<li><strong>GQA</strong>：<code>k.repeat_interleave(H // KVH, dim=1)</code>；也可以把 q reshape 成 <code>[KVH, group, D]</code> 不复制 K。</li>
+<li><strong>注意力</strong>：fp32 scores，softmax 在 j 维，加权和后 <code>.to(q.dtype)</code> 写入输出 <code>[B, H, D]</code>。einsum <code>&quot;hd,nhd-&gt;hn&quot;</code> / <code>&quot;hn,nhd-&gt;hd&quot;</code> 很方便。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>块 1、offset 3；展平后第一维下标就是 slot。</li>
+<li>写到展平后的最后一个位置（最后一块的最后一个 offset），不报错——这正是危险之处。</li>
+<li>前 2 项；2·4 = 8 个位置，截掉后 3 个，只留前 5 个。</li>
+<li>通常是 int32（vLLM 里为省显存/喂给 kernel）；新版 PyTorch 也接受，但转 long 再做高级索引最稳妥。</li>
+<li><code>repeat_interleave</code>（[a,b] → [a,a,a,a,b,b,b,b]）；repeat 得 [a,b,a,b,…]，对应 h % KVH。</li>
+<li>q、k、v 都可以转 fp32 算 scores / softmax / 加权和；输出转回 q.dtype。</li>
+<li>softmax 之前乘在 scores 上；乘在之后只是把输出整体缩放，注意力分布不对。</li>
+</ol>
+</div></details>
+<p><strong>自检</strong>：自己写一个 dense 版本（直接用连续的 K/V 张量算注意力），随机生成若干序列长度（含 1、恰好 bs 的倍数、非倍数），打乱物理块分配、把 block table 尾部填成大垃圾值，与 paged 版本 <code>torch.testing.assert_close</code> 对拍。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>Triton 版：一个 program 处理 (seq, head)，按 block 循环做 online softmax。</li>
+<li>prefill 的 varlen 版本怎么写？</li>
+</ul>
+<p>对照源码：<code>vllm/v1/attention/backends/triton_attn.py</code></p>
+<nav class="pager"><a class="prev" href="p08_overview.html"><small>← 上一题</small>#18 · P08 批不变的采样器（per-request seed）</a><a class="next" href="p12_overview.html"><small>下一题 →</small>#20 · P12 SharedMemoryConnector：跨进程 put/get 协议</a></nav>
+</main>
+</body>
+</html>

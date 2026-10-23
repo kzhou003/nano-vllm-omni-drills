@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P13 提示 · ChunkAdapter：后台收发线程与顺序/清理语义</title>
+<meta name="description" content="async_chunk 的心脏：调度线程只做快照入队，save 线程构造 payload 并 put，recv 线程轮询 get；还要处理 cancel、None payload，以及“清理时恰好有一个 chunk 在读”。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p12_overview.html">← <span class="lbl">P12</span></a><a href="p15_overview.html"><span class="lbl">P15</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#21 · Track C · 数据面 · 书 p.91</div>
+<h1>P13 · ChunkAdapter：后台收发线程与顺序/清理语义</h1>
+<p class="lede">async_chunk 的心脏：调度线程只做快照入队，save 线程构造 payload 并 put，recv 线程轮询 get；还要处理 cancel、None payload，以及“清理时恰好有一个 chunk 在读”。</p>
+<div class="badges">
+<span class="badge">⏱ <b>75 min</b></span>
+<span class="badge diff-难">难度 <b>难</b></span>
+<span class="badge">实现 <code>mine/p13_chunk_adapter.py</code></span>
+<span class="badge">验收 <code>./check.sh p13</code></span>
+<span class="badge">提示 <b>A-21</b> · 参考解 <b>C-21</b> <code>solutions/p13_chunk_adapter.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P13">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC · LIFE</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 1 的 save 线程（build = n if n % 3 else None，final 在 n=6）</a></li><li><a href="#s6">逐步图：cleanup 竞态（connector 的 get 很慢）</a></li><li><a href="#s7">三级提示</a></li><li><a href="#s8">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：每个 stage 进程的 scheduler 里有一个 ChunkAdapter：它是 connector（只管传输，P12）和 scheduler（P11）之间的一层，负责 chunk 的完整生命周期。</li>
+</ul>
+<pre><code>发送端（stage 0）                                  接收端（stage 1）
+scheduler 线程: save_async(req, snapshot, final)   scheduler 线程: load_async(req) / poll_ready()
+     │ 只做 deepcopy + 入队（不阻塞调度）               ▲ 已提交的 chunk，按序
+save 线程: build_payload(snapshot)                 recv 线程: get(f&quot;{req}_{src}_{next_id}&quot;)
+           put(f&quot;{req}_{stage}_{chunk_id}&quot;)                   拿到 → 在锁内检查“还注册着吗” → 提交
+           成功后 chunk_id += 1
+</code></pre>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>规则</th>
+<th>不遵守会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>save_async 深拷贝快照</td>
+<td>scheduler 下一步继续修改请求对象，后台线程读到的是“未来”的数据</td>
+</tr>
+<tr>
+<td>build_payload 和 put 都在锁外、在 save 线程</td>
+<td>慢的 Python 整形和 SHM 写阻塞调度，GPU 空等</td>
+</tr>
+<tr>
+<td>chunk_id 只在 put 成功后递增；None payload 不占 id</td>
+<td>接收端按连续 id 轮询，出现空洞就永远卡住</td>
+</tr>
+<tr>
+<td>cancel 不能吞掉 final chunk</td>
+<td>final chunk 是下游唯一的 EOS，丢了下游请求就永远停在 WAITING_FOR_CHUNK</td>
+</tr>
+<tr>
+<td>get 在锁外；提交前在锁内检查注册 token 是否还是同一个</td>
+<td>请求刚被清理，后台线程把迟到的 chunk 又写回去，污染下一个同 id 请求</td>
+</tr>
+<tr>
+<td>没有进展时退避 ~1ms，空闲时在 Condition 上睡</td>
+<td>busy-poll 吃满一个核，和 tokenize 抢 GIL</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>验收要点</strong>：单请求 50 个 chunk 有序 · 10 请求 × 30 chunk、随机延迟下各自有序 · save_async 永不阻塞调用者 · 快照隔离 · cancel 后 final chunk 仍送达、chunk id 连续 · None payload 被跳过且 id 无空洞 · cleanup 是提交栅栏：正在 get 中的 chunk 不会在 cleanup 之后出现。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">传菜窗口和编号小票</div><p>后厨（发送端）每出一道菜贴一张编号小票：0、1、2…，放到传菜窗口（connector）。跑堂（recv 线程）按编号去窗口取：没看到 k 号，就绝不去拿 k+1 号——这就是顺序的来源。所以后厨只在菜真的放上窗口之后才撕下一张小票（put 成功后 id+1）；“这一步没有新菜”（payload 为 None）就别撕小票。最后一道菜带牌子“本桌已上齐”（finished=True）；客人中途退单，还没做的菜都可以不做，但“已上齐”的牌子一定要送（空盘子，data=None）。厨师下单时拿的是点菜单的复印件（deepcopy）。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">翻台和桌卡（generation token）</div><p>7 号桌的客人走了（cleanup_receiver），马上又坐下一拨新客人，桌号还是 7。跑堂手里端着上一拨客人点的菜回来——如果他只问“7 号桌有人吗？”（有！）就会把旧菜端给新客人。正确做法：每拨客人入座时发一张独一无二的桌卡（<code>object()</code>），跑堂出发前记下桌卡，回来时核对“现在桌上的是不是同一张卡”（<code>is</code>），不是就倒掉。核对和上菜要在同一把锁里一口气做完。</p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC · LIFE</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>P13</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>每个 stage 进程：调度线程（P10 busy loop）+ save 线程 + recv 线程（daemon）。线程之间 Lock / Condition / Event；进程之间只有 connector 上的 key</td>
+</tr>
+<tr>
+<td>S</td>
+<td>发送端：待发送队列（调度线程 append、save 线程 popleft）、每请求下一个发送 id（save 线程写）、已取消集合（调度线程写、save 线程读 → 加锁）。接收端：注册表 req → token、下一个接收 id、已提交未取走的列表（两边都写 → 同一把锁）</td>
+</tr>
+<tr>
+<td>B</td>
+<td>build_payload、connector.put、connector.get：慢，全部在锁外、在后台线程。空闲时 <code>Condition.wait(timeout)</code>；有请求没数据时退避 ~1ms。调度线程上没有任何阻塞</td>
+</tr>
+<tr>
+<td>W</td>
+<td>调度线程：只做快照入队、登记、取结果。save 线程：只做 build + put，FIFO。recv 线程：只做 get + 提交，不准持锁 get</td>
+</tr>
+<tr>
+<td>C</td>
+<td>调度线程 → save 线程：deque + Condition；save → recv（跨进程）：connector 的 key；recv → 调度线程：ready 字典，poll_ready 在锁内整体换出</td>
+</tr>
+<tr>
+<td>L</td>
+<td>start：建两个线程；stop：置 Event → 对两个 Condition notify_all → 带超时 join。每个请求：load_async 发 token → 收到 final 或 cleanup_receiver 时注销；发送端在 final 发出后复位 id 和取消标记</td>
+</tr>
+<tr>
+<td>I</td>
+<td>除 start / stop，所有公开方法都在调度线程上调用，持锁时间必须是微秒级</td>
+</tr>
+<tr>
+<td>F</td>
+<td>① chunk id 从 0 连续，只在 put 成功后前进，None 的非 final 块不占 id；② final 块一定发出（被取消时 data=None）；③ 只有 token 身份没变时才提交；④ 每个提交的块在 poll_ready 里恰好出现一次、按顺序</td>
+</tr>
+<tr>
+<td>E</td>
+<td>chunk 在 load_async 之前就 put 了（connector 一直保存它，照样能收到）；put 抛异常（id 不前进）；清理时恰好在读；同名请求重新注册；stop() 时线程正睡在 wait 上</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>没 deepcopy → 例 2 收到 <code>[&quot;a&quot;,&quot;b&quot;,&quot;c&quot;]</code>。</li>
+<li>入队时就 +1 → 例 1 出现 <code>u9_2_2</code> 之后跳到 <code>u9_2_4</code>，接收端永远卡在等 <code>u9_2_3</code>。</li>
+<li>cancel 连 final 一起吞掉 → 下游永远收不到 finished。</li>
+<li>只在 get 之前检查注册状态（或只查 <code>req in registered</code>）→ get 期间被清理的块在 cleanup 之后出现在 poll_ready。</li>
+<li>空闲时 busy-loop → CPU 100%，其他线程（含测试）变慢。</li>
+<li>在锁外遍历 ready（recv 线程可能正在 append）。</li>
+<li>load_async 不幂等：同一 req 在轮询队列里出现两次，两份轮询抢同一个 chunk id。</li>
+<li>stop 不 notify：线程在 wait 里多睡一个 timeout；wait 不带 timeout：丢通知就永远睡。</li>
+</ul>
+<h2 id="s5">逐步图：例 1 的 save 线程（build = n if n % 3 else None，final 在 n=6）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ snd(stage_id=2) → rcv(src_stage_id=2)，rcv.load_async(&quot;u9&quot;) 已调用</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. (u9, 1, F)</div><p>build → 1 → put <strong>u9_2_0</strong> → next_send_id = 1</p>
+</div><div class="step" data-hl=""><div class="step-title">2. (u9, 2, F)</div><p>build → 2 → put <strong>u9_2_1</strong> → next_send_id = 2</p>
+</div><div class="step" data-hl=""><div class="step-title">3. (u9, 3, F)</div><p>build → <strong>None</strong> 且非 final → 跳过，<strong>不消耗 id</strong>（仍是 2）</p>
+</div><div class="step" data-hl=""><div class="step-title">4. (u9, 4, F) / (u9, 5, F)</div><p>put <strong>u9_2_2</strong>、<strong>u9_2_3</strong> → next_send_id = 4</p>
+</div><div class="step" data-hl=""><div class="step-title">5. (u9, 6, T)</div><p>build → None，但是 final → 仍然 put，data=None → <strong>u9_2_4</strong>；之后删除计数并复位。</p>
+<p><code>conn.puts == [&quot;u9_2_0&quot;, &quot;u9_2_1&quot;, &quot;u9_2_2&quot;, &quot;u9_2_3&quot;, &quot;u9_2_4&quot;]</code>——6 次 save，5 个连续 id</p>
+</div><div class="step" data-hl=""><div class="step-title">6. 接收端</div><p>recv 线程 next_recv_id 依次 0→1→2→3→4→5；拿到 u9_2_4 的 finished=True 后 u9 被注销，不再放回轮询队列。</p>
+<p><code>rcv.poll_ready() -&gt; {&quot;u9&quot;: [{data:1},{data:2},{data:4},{data:5},{data:None, finished:True}]}</code></p>
+</div></div></div>
+<h2 id="s6">逐步图：cleanup 竞态（connector 的 get 很慢）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 只检查 “q in registered” 为什么不够</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. t0 调度线程 load_async(q)</div><p>registered[q] = <strong>tok1</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">2. t1 recv 线程</div><p>锁内读到 (tok1, id=0)；<strong>锁外</strong>进入 <code>get(&quot;q_0_0&quot;)</code>……</p>
+</div><div class="step" data-hl=""><div class="step-title">3. t2 调度线程 cleanup_receiver(q)</div><p>registered[q] 删除（recv 线程还在 get 中）</p>
+</div><div class="step" data-hl=""><div class="step-title">4. t3 调度线程 load_async(q)（同名新请求）</div><p>registered[q] = <strong>tok2</strong></p>
+</div><div class="step" data-hl=""><div class="step-title">5. t4 get 返回数据</div><p>锁内比较 <code>registered[q] is tok1</code>？</p>
+
+<details class="answer"><summary>结果</summary><div class="body"><p>False → <strong>丢弃</strong>。如果只检查 <code>q in registered</code>，t4 会是 True，旧请求的数据就混进了新请求。</p>
+</div></details></div></div></div>
+<h2 id="s7">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>例 1 见逐步图（注意 key 里的数字：发送端用自己的 stage_id，接收端用 src_stage_id 拼同一个 key）。</p>
+<p><strong>例 2：快照隔离 + poll_ready 是“取走自上次以来的”</strong></p>
+<pre><code class="language-python">live = [&quot;a&quot;]; rcv.load_async(&quot;v&quot;)
+snd.save_async(&quot;v&quot;, live, is_final=False)
+live.append(&quot;b&quot;)                        # 调度线程继续改活对象
+snd.save_async(&quot;v&quot;, live, is_final=True)
+live.append(&quot;c&quot;)
+# 收到的 data 依次是 [&quot;a&quot;]、[&quot;a&quot;, &quot;b&quot;]；conn.puts == [&quot;v_0_0&quot;, &quot;v_0_1&quot;]
+
+snd.save_async(&quot;q&quot;, 1, False); snd.save_async(&quot;q&quot;, 2, False)    # 稍等
+rcv.poll_ready() -&gt; {&quot;q&quot;: [{&quot;data&quot;: 1, ...}, {&quot;data&quot;: 2, ...}]}
+rcv.poll_ready() -&gt; {}                                          # 已经被取走了
+snd.save_async(&quot;q&quot;, 3, True)                                    # 稍等
+rcv.poll_ready() -&gt; {&quot;q&quot;: [{&quot;data&quot;: 3, &quot;finished&quot;: True}]}
+</code></pre>
+<p>chunk 在 load_async 之前就已被 put，load_async 之后照样能收到。</p>
+<p><strong>例 3：cancel_sender</strong>（build_payload 阻塞在 gate 上）：save &quot;p0&quot;（开始 build，卡住）→ 排队 p1、p2、p3 → save &quot;end&quot;(final) → cancel_sender(&quot;w&quot;) → 放行。接收端得到 <code>[{&quot;data&quot;: &quot;p0&quot;, &quot;finished&quot;: False}, {&quot;data&quot;: None, &quot;finished&quot;: True}]</code>，<code>conn.puts == [&quot;w_0_0&quot;, &quot;w_0_1&quot;]</code>。p0 会不会被发出取决于取消时它是否已过了取消检查——两种都可接受；但 id 必须连续、final 必须到。</p>
+<h4>关键问题</h4>
+<ol>
+<li>save_async 在调度线程上执行，必须立即返回。它最多只能做哪两件事？build_payload 为什么不能在这里调用？</li>
+<li>chunk_id 什么时候 +1：入队时、build 之后、还是 put 成功之后？</li>
+<li>build_payload 返回 None 时什么情况跳过、什么情况仍要 put？final 块被 cancel 后 data 是什么？</li>
+<li>接收端怎么知道下一个要 get 的 key？每个请求要记住哪些状态？收到 finished 后还要轮询吗？</li>
+<li>recv 线程在锁外 get 时，调度线程 cleanup 又 load_async 同一个 req。recv 回来怎么判断“这块属于已作废的那次注册”？</li>
+<li>10 个请求都在轮询但都没数据时 recv 线程该做什么？完全没有请求时呢？</li>
+<li>stop() 要迅速返回。save 线程正睡在 Condition.wait() 上，怎么叫醒？如果它恰好在 notify 之前一瞬间才去 wait 呢？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>save_async / cancel_sender / load_async / poll_ready / cleanup_receiver 都在调度线程上调用；SAVE 线程只做 build + put；RECV 线程只做 get + 提交。</li>
+<li>put 的对象固定是 <code>{&quot;data&quot;: payload, &quot;finished&quot;: is_final}</code>；poll_ready 原样返回，按 id 顺序放在 <code>{req: [...]}</code>；没有新内容的请求不出现。</li>
+<li>per-registration token：load_async 时生成 <code>object()</code> 存起来；cleanup 时删掉；recv 线程 get 之前记下 token，回来后在锁内用 <code>is</code> 比较。</li>
+<li><code>Condition.wait(timeout=...)</code> 返回后必须重新检查条件；给 wait 加较短超时（如 0.1s），丢通知也只是多睡一会儿。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>发送端</strong>：FIFO deque <code>(req, snapshot, is_final)</code> + Condition 唤醒 save 线程；<code>next_send_id: dict[req, int]</code>；<code>cancelled: set[req]</code>。只有一个 save 线程按 FIFO 处理，同一请求的 chunk 天然有序。</li>
+<li><strong>save 线程一次迭代</strong>：取一项 → 查 cancelled（短暂持锁）→ 被取消且非 final：丢弃 → 被取消且 final：data=None → 否则锁外 build → data 为 None 且非 final：跳过 → put 到当前 id 的 key → 成功后 id+1；final 时清理 id 计数和 cancelled 标记。put 抛异常时不 +1。</li>
+<li><strong>接收端</strong>：<code>registered: dict[req, token]</code>、<code>next_recv_id</code>、<code>ready: dict[req, list]</code>、轮询队列 + Condition。load_async 幂等。</li>
+<li><strong>recv 线程一轮</strong>：对当前队列里的每个请求轮询一次：锁内读 (token, next_id)，没注册了就扔掉；锁外 get；没数据放回队尾；有数据锁内比对 token → 一致才 append、id+1；finished 就注销（不再放回），否则放回。一轮结束：队列空 → Condition 上睡（带超时）；有请求但没进展 → 睡 ~1ms；有进展 → 立刻下一轮。</li>
+<li><strong>poll_ready 原子交换</strong>：锁内把 ready 整个换成新的空 dict 并返回旧的。</li>
+<li><strong>cleanup_receiver 是提交栅栏</strong>：锁内删除 registered、next_recv_id、ready。由于“比对 token + 提交”也在同一把锁内，cleanup 返回之后任何提交要么已发生（已被删掉），要么会看到 token 不匹配而丢弃。</li>
+<li><strong>stop()</strong>：设 Event，对两个 Condition 分别 <code>with cond: cond.notify_all()</code>，再 join（带超时）。线程设为 daemon。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>只做：deepcopy 快照 + 入队（并 notify）。build_payload 可能很慢，会阻塞调度。</li>
+<li>put 成功之后。入队时 +1 会让被跳过的 None 和 put 失败的块各占一个 id，接收端按 id 顺序轮询，会永远等那个不存在的 key。</li>
+<li>None 且非 final → 跳过；final → 无论如何都 put；被 cancel 的 final → data=None。</li>
+<li>key = <code>f&quot;{req}_{src_stage_id}_{next_id}&quot;</code>；每个请求：注册 token、下一个 id、已提交未取走的列表。收到 finished 后停止轮询并注销。</li>
+<li>用 token 的身份比较（<code>is</code>）；只查是否在 registered 中不够（见竞态逐步图）。</li>
+<li>有请求无数据：短暂退避（~1ms）后再轮询；没有请求：在 Condition 上睡，直到 load_async 唤醒（带超时兜底）。</li>
+<li>stop 设 Event 并 notify_all；wait 带超时，即使错过通知也最多晚一个超时周期醒来，醒来后检查 Event 退出。</li>
+</ol>
+</div></details></div></details>
+<h2 id="s8">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>如果有多个 save 线程，顺序怎么保证？</li>
+<li>build_payload 需要 TP collective 时能放在后台线程吗？</li>
+</ul>
+<p>对照源码：<code>distributed/omni_connectors/transfer_adapter/base.py:20-140</code> · <code>chunk_transfer_adapter.py:381-503</code> · <code>:539-555</code> · <code>:714-723</code> · <code>:991-1042</code></p>
+<nav class="pager"><a class="prev" href="p12_overview.html"><small>← 上一题</small>#20 · P12 SharedMemoryConnector：跨进程 put/get 协议</a><a class="next" href="p15_overview.html"><small>下一题 →</small>#22 · P15 Thinker→Talker 输入构造（含“差一行”）</a></nav>
+</main>
+</body>
+</html>

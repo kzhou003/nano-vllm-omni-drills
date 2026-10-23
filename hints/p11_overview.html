@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P11 提示 · WAITING_FOR_CHUNK：停靠与归还</title>
+<meta name="description" content="上游 scheduler 不认识“等 chunk”这种状态；你要在它外面包一层——没数据的请求在它眼里必须不存在。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p10_overview.html">← <span class="lbl">P10</span></a><a href="p07_overview.html"><span class="lbl">P07</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#15 · Track B · Stage 进程与调度 · 书 p.68</div>
+<h1>P11 · WAITING_FOR_CHUNK：停靠与归还</h1>
+<p class="lede">上游 scheduler 不认识“等 chunk”这种状态；你要在它外面包一层——没数据的请求在它眼里必须不存在。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p11_chunk_aware_scheduler.py</code></span>
+<span class="badge">验收 <code>./check.sh p11</code></span>
+<span class="badge">提示 <b>A-15</b> · 参考解 <b>C-15</b> <code>solutions/p11_chunk_aware_scheduler.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P11">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC · LIFE</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 1（x 普通请求，t1 等 chunk）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：async_chunk 下，talker 的请求在预热后就进入了 scheduler，但输入是 thinker 一块一块发来的。下一块到达之前不能被调度：调度它会占 token budget 和 KV，而 forward 时根本没有输入。vllm-omni 给 RequestStatus 加了负值状态 <code>WAITING_FOR_CHUNK</code>，并在每次 schedule() 前后加钩子：</li>
+</ul>
+<pre><code>schedule():
+    ① 把已就绪的停靠请求放回原队列
+    ② 把 needs_chunk 且未就绪的请求从 waiting/running 中移出，状态设为 WAITING_FOR_CHUNK，
+       记录来源队列和原状态，第一次停靠时调用 source.load_async(id)
+    try:     ③ base.schedule()        # 上游只看得到有数据的请求
+    finally: ④ 再归还一次已就绪的      # 即使上游抛异常也要归还
+</code></pre>
+<ul>
+<li><strong>为什么“移出”而不是“跳过”</strong>：上游 scheduler 代码不想改（AR-INV-001：vLLM 拥有基础调度语义）。题目里的 BaseScheduler 看到 <code>WAITING_FOR_CHUNK</code> 或 <code>ABORTED</code> 状态的请求会直接断言失败。</li>
+<li><strong>其他要求</strong>：归还到来源队列并恢复原状态；同时归还的多个请求按到达顺序排列 · <code>abort(id)</code> 任何时候都可调用：停靠中或队列里，之后都不能再被调度或归还。</li>
+</ul>
+<p><strong>验收要点</strong>：未就绪请求从不被调度、load_async 只调用一次 · 就绪后下一次 schedule 一定被调度 · running 中的请求等下一个 chunk 时同样被停靠 · 上游 schedule 抛异常时 finally 仍然归还 · 停靠期间 abort：不会再被调度/归还 · 同时归还多个请求时保持到达顺序。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">后厨的订单板和“等料夹”</div><p>主厨（上游 scheduler）只认墙上的订单板：“待做”栏（waiting）、“在做”栏（running），看到写着“等料”的单子会直接发火（AssertionError）。你是领班：每轮开工前把“料还没到”的单子从板上摘下，夹进等料夹（parked），背面写两行字：原来挂在哪栏（origin）、原来什么状态（previous status）；同时给隔壁打电话“这单的料请送来”（<code>load_async</code>，每摘一次打一次）。料到了就挂回原栏、恢复原状态；好几张同时到时按客人下单先后（<code>Req.arrival</code>）挂回。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">主厨摔锅、客人退单</div><p>主厨摔锅（base.schedule() 抛异常）：领班下班前仍要把“料已到”的单子挂回板上（finally），再把事故照实上报（异常继续往上抛）。客人退单（abort）：单子可能在待做栏、在做栏、等料夹三处——三处都要找、都要撕；只撕等料夹的，板上那张主厨照做；只写“已退”不摘下，主厨又要发火。</p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC · LIFE</h2>
+<p>P11 是 P11–P13 三道题里唯一完全单线程的一道：add / abort / schedule 都在同一个调度线程里调用。它的“并发”只来自 <code>is_ready()</code> 的答案由别的线程（P13 的 recv 线程）推进，你每次问都可能得到不同结果。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>P11</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>下游 stage 进程里的调度线程（P10 busy loop）。P11 只跨“调度线程 ↔ ChunkSource”一条边界，且只用两个非阻塞调用</td>
+</tr>
+<tr>
+<td>S</td>
+<td>parked、base.waiting / base.running、req.status：全部只由调度线程写（单写者，不用锁）</td>
+</tr>
+<tr>
+<td>B</td>
+<td>哪里都不许等。schedule() 绝不能阻塞等 chunk（会让整张 GPU 空转）——所以是“停靠 + 下一轮再问”</td>
+</tr>
+<tr>
+<td>W</td>
+<td>没有后台 worker。领班只负责摘单、挂单；送料的是 P13 的 recv 线程</td>
+</tr>
+<tr>
+<td>C</td>
+<td>ChunkSource 就是通道：load_async 是请求，is_ready 是回答</td>
+</tr>
+<tr>
+<td>L</td>
+<td>needs_chunk 请求会在 WAITING/RUNNING ⇄ WAITING_FOR_CHUNK 之间来回很多次；终点是完成或 ABORTED</td>
+</tr>
+<tr>
+<td>F</td>
+<td>① 上游 (c) 执行期间队列里没有 WAITING_FOR_CHUNK / ABORTED；② 每个请求任一时刻只在 waiting、running、parked 之一；③ 每次停靠恰好一次 load_async；④ 归还 = 原队列 + 原状态，同一批按 arrival 排序</td>
+</tr>
+<tr>
+<td>E</td>
+<td>上游抛异常（finally 仍归还、异常照抛）；chunk 恰好在 (c) 期间到达；同一请求先从 waiting、后从 running 停靠；abort 后 is_ready 仍返回 True</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>漏了 (a)：就绪后的第一次 schedule() 没调度它，要再等一轮。</li>
+<li>漏了 (d) 或没放在 finally 里：上游异常后请求永远留在 parked。</li>
+<li>恢复 status 写死 <code>&quot;WAITING&quot;</code>：running 来源的请求被恢复成 WAITING 后，上游不会再改它，状态一直错。</li>
+<li>finally 里写 return：把异常吞掉。</li>
+<li>先改 status 再记录 previous status：previous 永远是 WAITING_FOR_CHUNK。</li>
+<li>边遍历边删除（list 跳元素 / deque 抛 RuntimeError）：先 <code>list(...)</code> 拍快照。</li>
+<li>按 parked 插入顺序归还而不是按 arrival。</li>
+<li>abort 只查 parked 或只设 ABORTED 不移除。</li>
+</ul>
+<h2 id="s5">逐步图：例 1（x 普通请求，t1 等 chunk）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ R=RUNNING，W=WAITING，WFC=WAITING_FOR_CHUNK</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. #1 schedule，is_ready(t1)=F</div><p>(a) 无变化 → (b) waiting=[x(W)]，parked={t1: (waiting, W)}，t1(WFC)，<strong>load_async(&quot;t1&quot;)</strong></p>
+<p>base.schedule() → <code>[&quot;x&quot;]</code>；(d) running=[x(R)]，t1 仍停靠。loads = [t1]</p>
+</div><div class="step" data-hl=""><div class="step-title">2. #2 schedule，仍未就绪</div><p>t1 不在任何队列里，(b) 根本看不到它 → <strong>不会再调 load_async</strong>。</p>
+<p>返回 <code>[&quot;x&quot;]</code>；loads = [t1]</p>
+</div><div class="step" data-hl=""><div class="step-title">3. #3 schedule，is_ready(t1)=T</div><p>(a) 归还：waiting=[t1(W)]，parked={} → 上游返回 <code>[&quot;x&quot;, &quot;t1&quot;]</code>；running=[x(R), t1(R)]</p>
+</div><div class="step" data-hl=""><div class="step-title">4. #4 schedule，t1 吃完这块、下一块未到</div><p>(b) 从 <strong>running</strong> 停靠：parked={t1: (running, R)}，<strong>再调一次</strong> load_async。</p>
+<p>返回 <code>[&quot;x&quot;]</code>；loads = [t1, t1]——origin 和 previous status 是每次停靠时记录的。</p>
+</div><div class="step" data-hl=""><div class="step-title">5. #5 schedule，下一块到了</div><p>(a) 归还到 running，status 恢复 R → 返回 <code>[&quot;x&quot;, &quot;t1&quot;]</code></p>
+</div><div class="step" data-hl=""><div class="step-title">6. 小练习</div><p>若 #2 和 #3 之间，chunk 是在上游 schedule <strong>执行过程中</strong>到达的：</p>
+
+<details class="answer"><summary>t1 在第几次调用的哪一步被归还？第几次被调度？</summary><div class="body"><p>#2 的 (d) 归还到 waiting，#3 调度它。</p>
+</div></details></div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>例 1 见逐步图。</p>
+<p><strong>例 2：同时归还按 arrival 排序</strong>：add k(5)、m(3)、n(4)（都 needs_chunk）→ schedule() → <code>[]</code>（三个都停靠，load_async 记录 [&quot;k&quot;,&quot;m&quot;,&quot;n&quot;]）→ 三个 chunk 同时到达 → schedule() → <code>[&quot;m&quot;, &quot;n&quot;, &quot;k&quot;]</code>。</p>
+<p><strong>例 3：上游抛异常时 finally 仍归还</strong>：</p>
+<pre><code class="language-python">class Exploding(BaseScheduler):
+    def schedule(self):
+        src.ready.add(&quot;z&quot;)            # z 的 chunk 恰好在上游调度期间到达
+        raise RuntimeError(&quot;boom&quot;)
+
+s = ChunkAwareScheduler(Exploding(), src)
+s.add(Req(&quot;z&quot;, 0, needs_chunk=True)); s.add(Req(&quot;y&quot;, 1))
+s.schedule()       # RuntimeError(&quot;boom&quot;) 原样抛出
+# 之后：base.waiting == [y(WAITING), z(WAITING)]，parked == {}，load_async 记录 [&quot;z&quot;]
+</code></pre>
+<p>z 归还时 append 到 waiting 末尾，所以排在 y 之后；异常没被吞掉。</p>
+<h4>关键问题</h4>
+<ol>
+<li>BaseScheduler 一看到 WAITING_FOR_CHUNK 就断言失败。“停靠”只改 status 够不够？请求此时应该在哪个容器里？</li>
+<li>同一请求连续 3 次 schedule() 都没就绪，load_async 应调用几次？归还后又没就绪呢？什么机制天然保证“每次停靠一次”？</li>
+<li>running 中的请求被停靠时，previous status 是什么？归还时一律写 &quot;WAITING&quot; 的后果？</li>
+<li>为什么 (a) 先归还再 (b) 停靠？去掉 (a) 只靠上一轮的 (d)，会晚几轮被调度？</li>
+<li>在 (d) 中归还的请求，本轮 base.schedule() 的返回值里有它吗？</li>
+<li>“按 arrival order 归还”的 arrival 指什么？</li>
+<li>abort(id) 之后 is_ready(id) 仍可能 True，什么保证它不会被归还？它可能藏在哪几个地方？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li><code>parked[id] = (req, origin, previous_status)</code>；origin 用什么表示由你决定（如 &quot;waiting&quot; / &quot;running&quot;）。</li>
+<li>BaseScheduler：返回 running 的 id + waiting 的 id，然后把 waiting 全部挪进 running 并设为 RUNNING——它从不改 running 中请求的 status，恢复 status 的责任完全在你这层。</li>
+<li>只有 needs_chunk=True 的请求才会被停靠；is_ready 可以 True → False → True 反复变化。</li>
+<li>归还放回 origin 队列末尾（waiting 是 deque，running 是 list）。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li>拆两个私有 helper：<code>_restore_ready()</code>（扫描 parked，把就绪的按 arrival 放回来源队列）和 <code>_park_not_ready()</code>（扫描两个队列，把 needs_chunk 且未就绪的移进 parked）。schedule() 就只剩四行：restore → park → <code>try: return base.schedule()</code> → <code>finally: restore</code>。</li>
+<li><strong>load_async 去重</strong>：被停靠的请求已经不在队列里，(b) 下一轮看不到它，“停靠的那一刻调一次”天然满足“每次停靠一次”。想更保险可维护“已请求加载”集合，但要在归还/abort 时清掉。</li>
+<li><strong>归还顺序</strong>：先收集所有 is_ready 的条目，按 <code>req.arrival</code> 排序，再逐个删除、恢复 status、append。</li>
+<li><strong>abort 的三个藏身处</strong>：parked、base.waiting、base.running 都要查并移除，状态可设为 ABORTED。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>只改 status 不够：上游遍历 waiting/running，见到 WFC 就断言。必须从队列中移出，只存在于 parked。</li>
+<li>连续 3 次未就绪：1 次。归还后再次停靠：再 1 次（共 2 次）。机制：停靠后请求不在队列，(b) 遍历不到它。</li>
+<li>&quot;RUNNING&quot;；写死 &quot;WAITING&quot; 会让它永远带着错误状态待在 running。</li>
+<li>没有 (a) 时，两次调用之间就绪的请求要等下一次的 (d) 才回队列，晚 1 轮。</li>
+<li>不在（上游已经跑完），下一轮被调度。</li>
+<li><code>Req.arrival</code> 字段。</li>
+<li>从 parked 删除即可阻止归还（归还只扫描 parked）；它还可能在 base.waiting 或 base.running，三处都要删。</li>
+</ol>
+</div></details>
+<p><strong>abort 的追踪</strong>（add a(0)、b(1, needs_chunk)、c(2)；b 没就绪）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>操作</th>
+<th>waiting</th>
+<th>running</th>
+<th>parked</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>schedule() → [&quot;a&quot;,&quot;c&quot;]</td>
+<td>[]</td>
+<td>[a, c]</td>
+<td>{b}</td>
+</tr>
+<tr>
+<td>abort(&quot;b&quot;)</td>
+<td>[]</td>
+<td>[a, c]</td>
+<td>{}（从停靠表删除）</td>
+</tr>
+<tr>
+<td>abort(&quot;c&quot;)</td>
+<td>[]</td>
+<td>[a]</td>
+<td>{}</td>
+</tr>
+<tr>
+<td>b 的 chunk 到了；schedule() → [&quot;a&quot;]</td>
+<td>[]</td>
+<td>[a]</td>
+<td>{}——b 不在 parked，(a)/(d) 根本看不到它</td>
+</tr>
+</tbody>
+</table></div>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>为什么 vllm-omni 不在 step 中途调用 <code>waiting_queue.prepend_requests</code>？</li>
+<li>recv 线程拿到数据后能直接改 <code>request.prompt_token_ids</code> 吗？</li>
+</ul>
+<p>对照源码：<code>core/sched/omni_ar_scheduler.py:408-451</code> · <code>distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py:1120-1186</code> · <code>:1488-1532</code> · <code>patch.py:364-372</code></p>
+<nav class="pager"><a class="prev" href="p10_overview.html"><small>← 上一题</small>#14 · P10 EngineCore busy loop</a><a class="next" href="p07_overview.html"><small>下一题 →</small>#16 · P07 Scheduler：continuous batching + chunked prefill + 抢占</a></nav>
+</main>
+</body>
+</html>

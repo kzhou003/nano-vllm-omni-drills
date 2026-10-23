@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P01 提示 · OutputSink：线程 → asyncio 的批量唤醒</title>
+<meta name="description" content="orchestrator 线程每秒产生上万条输出，前端 asyncio 循环要消费它们；每条都 call_soon_threadsafe 太贵，只唤醒一次又容易丢唤醒。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p03_overview.html">← <span class="lbl">P03</span></a><a href="p04_overview.html"><span class="lbl">P04</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#11 · Track A · 前端与 Orchestrator · 书 p.54</div>
+<h1>P01 · OutputSink：线程 → asyncio 的批量唤醒</h1>
+<p class="lede">orchestrator 线程每秒产生上万条输出，前端 asyncio 循环要消费它们；每条都 call_soon_threadsafe 太贵，只唤醒一次又容易丢唤醒。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p01_output_sink.py</code></span>
+<span class="badge">验收 <code>./check.sh p01</code></span>
+<span class="badge">提示 <b>A-11</b> · 参考解 <b>C-11</b> <code>solutions/p01_output_sink.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P01">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · T · SBWC（先自己想）</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 2 的交错时间线</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：API 进程里有两个事件循环：前端循环（HTTP、SSE、tokenize）和 orchestrator 线程里的循环。跨线程唤醒 asyncio 只能用 <code>loop.call_soon_threadsafe</code>：它会往 loop 的 self-pipe 写一个字节并加锁，单次约微秒级，每秒上万次就很可观。</li>
+<li><strong>目标设计</strong>：</li>
+</ul>
+<pre><code>生产者（任意线程）                         消费者（前端 loop）
+put(x):                                   get_batch():
+  items.append(x)                           ① out = drain(); if out: return out
+  if 已有唤醒在途: return                    ② event.clear(); 标记“无唤醒在途”   ← 武装
+  标记“唤醒在途”                             ③ out = drain(); if out: return out  ← 关键
+  call_soon_threadsafe(event.set)           ④ await event.wait()（带超时）
+</code></pre>
+<ul>
+<li><strong>丢唤醒是怎么发生的</strong>：没有第 ③ 步时：消费者在 ① 发现队列空 → 生产者此刻 append 一条，看到“唤醒在途”（上一轮留下的）于是不唤醒 → 消费者 ② 武装 → ④ 睡下。那条消息一直躺在队列里，直到下一条 put 或超时。测试通过 <code>after_empty_drain</code> 钩子把一次 put 精确插进 ① 和 ② 之间。</li>
+<li><strong>需求</strong>：put 线程安全、永不阻塞、同一生产者顺序保持 · 一个“唤醒周期”内最多一次 <code>call_soon_threadsafe</code>，次数记在 <code>wakeups_scheduled</code> · <code>get_batch</code> 返回 1..max_items 条，超时返回 []。</li>
+</ul>
+<p><strong>验收要点</strong>：基本 FIFO · 前端未消费时 1000 次 put 只调度 1 次唤醒 · 超时返回 [] · 4 生产者 × 5000 条各自顺序不乱、消费者不饿死 · 乒乓 300 轮不丢唤醒 · “空 drain 之后、重新武装之前”注入的 put 必须立即被拿到。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">信箱、门铃和门上的小旗</div><p>你（前端 loop）住楼上，楼下有信箱（队列）。邮递员（orchestrator 线程）只能按门铃（<code>call_soon_threadsafe</code>）叫你下楼——每按一次你都要跑一趟楼梯，很贵。于是信箱旁插一面小旗（“唤醒在途”）：① 邮递员投信后，小旗倒着就竖起来并按一次铃；已竖着说明铃按过了、你正在下楼的路上，就不再按。② 你下楼把信一次拿光。③ 只有准备回楼上休息时才把小旗放倒。</p>
+</div>
+
+<div class="callout warn"><div class="callout-title">丢唤醒的那一瞬间</div><p>你下楼打开信箱，空的，转身准备上楼。就在你还没放倒小旗的瞬间，邮递员投了一封信——他看小旗还竖着（上一轮留下的），以为铃按过了，没按就走了。你放倒小旗，上楼睡觉，那封信在信箱里躺到天亮。<strong>解法：放倒小旗之后再看一眼信箱（第二次 drain）。</strong></p>
+</div>
+<h2 id="s3">框架视角 · T · SBWC（先自己想）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>问题</th>
+<th>提示</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T</td>
+<td>生产者、消费者在哪？跨哪条边界？</td>
+<td>多个普通线程 → 一个 asyncio loop；只能走 <code>call_soon_threadsafe</code> 这座桥</td>
+</tr>
+<tr>
+<td>S</td>
+<td>共享状态？谁读谁写？</td>
+<td>“待取的数据”和“唤醒是否在途”。deque 的 append/popleft 在 CPython 里原子；标志的“检查并设置”不是，要锁</td>
+</tr>
+<tr>
+<td>B</td>
+<td>谁会阻塞？谁绝不能阻塞？</td>
+<td>put 永不阻塞；get_batch 只能在 loop 里 await，不能 time.sleep 或用线程锁去等</td>
+</tr>
+<tr>
+<td>F</td>
+<td>不变量</td>
+<td>“队列非空 ⇒ 要么消费者醒着，要么有一次唤醒在途”。上面的时间线在哪一步违反了它？</td>
+</tr>
+<tr>
+<td>E</td>
+<td>边界</td>
+<td>超时；max_items 比积压少（剩下的下次 get_batch 会不会白等？）；多生产者交错</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>只 drain 一次就睡：例 2 场景卡到超时；乒乓式交互时不时卡住。</li>
+<li>每次 put 都 <code>call_soon_threadsafe</code>：功能正确，1000 次 put 产生 1000 次唤醒。</li>
+<li><strong>先看标志再 append</strong>：生产者看到 False → 调度唤醒 → 消费者醒来 drain 为空 → 武装、睡下 → 生产者这时才 append 且不再唤醒，数据卡住。</li>
+<li>用 <code>asyncio.Queue</code> 跨线程 put：不是线程安全的，偶发数据丢失或 loop 不醒；在生产者线程直接 <code>event.set()</code> 同理。</li>
+<li>持锁调用钩子或持锁 await：死锁。</li>
+<li>从不 <code>event.clear()</code>：Event 一直 set，wait 立即返回，空队列时在不让出的循环里空转（有 timeout 就烧满 CPU，None 就永远卡死）。</li>
+<li>每圈重新计算完整 timeout：被伪唤醒多次后总等待时长超标；应入口算一次 deadline。</li>
+</ul>
+<h2 id="s5">逐步图：例 2 的交错时间线</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ 在“空 drain 之后、武装之前”插入一次 put</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. t0：上一轮没武装</div><p>上一轮 get_batch 直接从队列拿走 'a' 返回（没武装）。</p>
+<p>标志 = <strong>True</strong>，队列 = <span class="cells"><span class="cell gap">·</span></span>，wakeups_scheduled = 1</p>
+</div><div class="step" data-hl=""><div class="step-title">2. t1：消费者第一次 drain</div><p>drain → <code>[]</code>。标志 True，队列空。</p>
+</div><div class="step" data-hl=""><div class="step-title">3. t2：钩子里另一线程 put(&#x27;b&#x27;)</div><p>生产者 <code>append('b')</code>；看到标志 True → <strong>不调度唤醒</strong>。</p>
+<p>标志 True，队列 = <span class="cells"><span class="cell on">b</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">4. t3：消费者武装</div><p><code>event.clear()</code>；在锁里标志置 <strong>False</strong>。队列仍是 <span class="cells"><span class="cell on">b</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">5. t4：第二次 drain → 拿到 &#x27;b&#x27;</div><p><code>_drain()</code> → <code>['b']</code>，立即返回（几乎 0 秒）。wakeups_scheduled 仍是 1。</p>
+<p>返回后标志 False、Event clear：下一次 put 会正常调度唤醒，计数变成 2。</p>
+</div><div class="step" data-hl=""><div class="step-title">6. t4&#x27;：朴素实现会怎样</div><p>没有第二次 drain：直接 <code>await event.wait()</code> → 没人会 set（'b' 的 put 没调度唤醒）→ <strong>睡满 timeout</strong>。</p>
+<p>把“第二次 drain”那两行删掉再跑例 2，你会看到它卡满 2 秒——这是理解本题最快的办法。</p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1：单线程里观察唤醒计数</strong>（<code>s = OutputSink(); s.bind_loop(); s.put(&quot;a&quot;); s.put(&quot;b&quot;); s.put(&quot;c&quot;)</code>）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>调用</th>
+<th>返回</th>
+<th>wakeups_scheduled</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3 次 put</td>
+<td>—</td>
+<td>1</td>
+<td>第一次 put 发起唤醒；后两次看到“在途”，不再调度</td>
+</tr>
+<tr>
+<td><code>await s.get_batch(max_items=2)</code></td>
+<td>['a','b']</td>
+<td>1</td>
+<td>队列非空，立刻返回，不睡</td>
+</tr>
+<tr>
+<td><code>await s.get_batch(max_items=2)</code></td>
+<td>['c']</td>
+<td>1</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>s.put(&quot;d&quot;)</code></td>
+<td>—</td>
+<td>1</td>
+<td>上一轮唤醒还“在途”（消费者没重新武装），不调度</td>
+</tr>
+<tr>
+<td><code>await s.get_batch()</code></td>
+<td>['d']</td>
+<td>1</td>
+<td>第一次 drain 就拿到</td>
+</tr>
+<tr>
+<td><code>await s.get_batch(timeout=0.05)</code></td>
+<td>[]</td>
+<td>1</td>
+<td>约 0.05s 后超时；这次真正“武装”了</td>
+</tr>
+<tr>
+<td><code>s.put(&quot;e&quot;)</code></td>
+<td>—</td>
+<td>2</td>
+<td>武装之后的第一次 put 才再调度一次</td>
+</tr>
+<tr>
+<td><code>await s.get_batch()</code></td>
+<td>['e']</td>
+<td>2</td>
+<td></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>例 3</strong>：消费者已在等（<code>create_task(s.get_batch(timeout=2))</code> 后 sleep 0.01），另一线程连 put 5 条 → <code>await task</code> 得 <code>[0,1,2,3,4]</code>，<code>wakeups_scheduled == 1</code>。</p>
+<h4>关键问题</h4>
+<ol>
+<li>“唤醒在途”标志由谁置 True、谁置 False？直接从队列拿到数据返回时会被置回吗？有问题吗？</li>
+<li>为什么 put() 不能直接 <code>event.set()</code>？<code>asyncio.Event</code> 和 <code>call_soon_threadsafe</code> 各自对线程有什么假设？</li>
+<li>put() 里“append 数据”和“检查/设置标志”谁先谁后？反过来会出现什么交错？</li>
+<li>“发现队列为空”和“武装”之间有一个窗口，put 落在这里且看到标志仍是 True，会怎样？怎样才能不错过？</li>
+<li><code>event.clear()</code> 什么时候调用？从不 clear 或在 drain 之前 clear 会怎样？</li>
+<li>timeout 是整个 get_batch 的总时长，循环可能转好几圈，怎么保证不超？</li>
+<li>钩子里另一个线程调用 put() 且钩子会等它结束；调用钩子时手里拿着 put 也要用的锁会怎样？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li><strong>唤醒周期</strong>：从“标志 False→True（某次 put 调度了唤醒）”到“消费者重新武装（置回 False）”。一个周期内 <code>call_soon_threadsafe</code> 最多一次；wakeups_scheduled 就是周期数。</li>
+<li>loop 已关闭时 <code>call_soon_threadsafe</code> 抛 RuntimeError，生产者可以忽略。</li>
+<li>put 可以拿一把很短的 threading.Lock（只保护标志的检查并设置），但不能等消费者。</li>
+<li>“1..max_items 条或 []”：有东西就至少返回 1 条且不超过 max_items，剩下留给下次；只有超时才返回空。</li>
+<li>bind_loop：不传参数时用 <code>asyncio.get_running_loop()</code>，并在这里创建 Event。bind 之前的 put 只需把数据放进队列。</li>
+<li>钩子严格在“一次 drain 发现为空”之后、“重新武装”之前调用；不持锁。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>状态</strong>：deque（数据）、<code>threading.Lock</code> + bool（“唤醒在途”）、loop、asyncio.Event、wakeups_scheduled。标志的检查并设置在锁里，计数在同一临界区加。</li>
+<li><strong>put 的顺序</strong>：先 append，再在锁里“若标志 False 则置 True 并计数”，出锁后（若需要）<code>call_soon_threadsafe(event.set)</code>。先 append 保证：任何人看到“标志已被置起”时，数据一定已在队列里。</li>
+<li><strong>get_batch 是一个循环</strong>：drain → 非空返回 → 调钩子 → 武装（clear Event、锁里置标志 False）→ 再 drain → 非空返回 → 等 Event（剩余超时）→ 回到开头。武装和第二次 drain 之间不能有 await。</li>
+<li><strong>为什么第二次 drain 能堵住窗口</strong>：并发 put 的“看标志”要么在武装之前——它看到 True、没调度，但它的 append 已经发生，第二次 drain 一定拿到；要么在之后——看到 False，会调度唤醒，wait 会醒。两种都不丢。</li>
+<li><strong>超时</strong>：入口 <code>deadline = loop.time() + timeout</code>，每次等待前算剩余；≤ 0 返回 []。<code>asyncio.wait_for(event.wait(), remaining)</code>，捕获 TimeoutError 后再 drain 最后一次。</li>
+<li><strong>伪唤醒</strong>：Event 可能被上一轮遗留的 set 置位，wait 立即返回、drain 为空——不是错误，循环再转一圈就会武装并睡下。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>put 置 True，消费者武装时置 False。直接拿到数据返回时不置回——没问题：消费者下次进来总是先 drain，只有真正准备睡前才武装；这段时间的 put 不唤醒，而此时也不需要唤醒（例 1 第 4 行）。</li>
+<li>asyncio.Event 只能在所属 loop 线程上操作；<code>call_soon_threadsafe</code> 是唯一线程安全地让 loop 执行回调并把它从 select 中叫醒的方式。</li>
+<li>必须先 append 再看标志；反过来的交错见“易错点”。</li>
+<li>那次 put 不会唤醒你；唯一的补救是武装之后再 drain 一次（时间线 t4）。</li>
+<li>clear 放在“武装”里，和“标志置 False”挨着，之后紧跟第二次 drain 和 await，中间无让出点。<code>call_soon_threadsafe</code> 排的回调只有在你 await 时才执行，所以 clear 和置 False 谁先谁后不影响正确性。从不 clear：wait 立即返回、空转（见易错点）。</li>
+<li>入口算一次 deadline，每圈用 <code>deadline - loop.time()</code>。</li>
+<li>死锁：钩子里的线程 put 要拿同一把锁，钩子在等那个线程结束。</li>
+</ol>
+</div></details></div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>如果消费者有多个（多个 asyncio loop）还能这样做吗？</li>
+<li><code>janus.Queue</code> 帮你解决了什么、没解决什么？</li>
+</ul>
+<p>对照源码：<code>engine/async_engine_utils.py:40-97</code> · <code>engine/omni_engine_base.py:973-991</code></p>
+<nav class="pager"><a class="prev" href="p03_overview.html"><small>← 上一题</small>#10 · P03 Orchestrator v2：async_chunk 预热 + 终态守门</a><a class="next" href="p04_overview.html"><small>下一题 →</small>#12 · P04 StagePool：粘性绑定、两阶段 abort、故障隔离</a></nav>
+</main>
+</body>
+</html>

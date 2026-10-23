@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P18 提示 · MRoPE 三维位置</title>
+<meta name="description" content="Qwen-VL/Omni 的 thinker 用 (t,h,w) 三维旋转位置；M01 是“给定位置怎么旋转”，本题是“位置本身怎么算”——算错不会报错，只会悄悄变笨。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="p14_overview.html">← <span class="lbl">P14</span></a><a href="p16_overview.html"><span class="lbl">P16</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#24 · Track D · 模型胶水（纯函数） · 书 p.102</div>
+<h1>P18 · MRoPE 三维位置</h1>
+<p class="lede">Qwen-VL/Omni 的 thinker 用 (t,h,w) 三维旋转位置；M01 是“给定位置怎么旋转”，本题是“位置本身怎么算”——算错不会报错，只会悄悄变笨。</p>
+<div class="badges">
+<span class="badge">⏱ <b>40 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/p18_mrope_positions.py</code></span>
+<span class="badge">验收 <code>./check.sh p18</code></span>
+<span class="badge">提示 <b>A-24</b> · 参考解 <b>C-24</b> <code>solutions/p18_mrope_positions.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="P18">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：例 1（图像在开头 + 矩形网格，spatial_merge=2）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：model runner 在 prefill 时为每个请求算出 <code>[3, T]</code> 的位置，以及一个 delta 供 decode 使用。</li>
+</ul>
+<pre><code>文本 n 个 token:       三轴都是 start + arange(n)
+图像 (t, h, w) patch:  LLM 网格 (t, h/m, w/m)，m = spatial_merge（2）
+                       token 顺序 t-major，然后 h，然后 w；位置 = (t_idx, h_idx, w_idx) + start
+每段结束：start = 当前最大位置 + 1             # 注意：不是“已有 token 数”！
+delta = (max_pos + 1) - T                      # decode 时位置 = 绝对下标 + delta（三轴相同）
+</code></pre>
+<ul>
+<li><strong>例子</strong>：</li>
+</ul>
+<pre><code>text(2) | image(1,4,4) → 2×2 网格 | text(3)
+t: 0 1 | 2 2 2 2 | 4 5 6
+h: 0 1 | 2 2 3 3 | 4 5 6
+w: 0 1 | 2 3 2 3 | 4 5 6
+T = 9, max = 6, delta = 7 - 9 = -2，第 9 个 token decode 位置 = 7
+</code></pre>
+<p>图像占了 4 个 token，却只推进了 2 个位置——这就是 delta 为负的原因，也是“用 len(tokens) 当 decode 位置”的 bug 来源。</p>
+<p><strong>验收要点</strong>：纯文本退化为普通 RoPE · text+image+text 的精确位置与 delta · 多帧矩形网格 · 形状与 dtype。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">电影院座位号</div><p>文本 token 一人一张票：坐“第 k 排第 k 座”（三轴相同），排号一个个往后推。一张图片像一个旅行团：6 个人包了一个 3 排 × 2 座的方块，票写“第 2+行 排、第 2+列 座”——整个团只用掉 3 排，而不是 6 排。后面的散客从团里最大排号 + 1 开始；如果按“已经进场 8 个人”发第 8 排的票，中间就空出好几排——模型会以为两段文字隔得很远。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">楼层和房间号</div><p>t 是楼层、h 和 w 是房间行列号。一段视频是 3 层楼、每层 1 间房：坐电梯上 3 层（t 推进 3），房间号不变。出楼之后下一段文字从“三个坐标里最大的那个 + 1”继续——不管最大值是楼层（视频）还是列号（宽图）。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<p>以 <code>[(&quot;text&quot;,2), (&quot;image&quot;,(1,6,4)), (&quot;text&quot;,…)…]</code> 为例（共 5 段、T = 14）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>量</th>
+<th>形状 / dtype</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>segments</td>
+<td>5 段</td>
+<td>按序列顺序，与 prompt 里的占位 token 一一对应</td>
+</tr>
+<tr>
+<td>2</td>
+<td>图像 (1, 6, 4) → (t, gh, gw)</td>
+<td>(1, 3, 2)</td>
+<td>gh = h // m，gw = w // m；t 方向不合并</td>
+</tr>
+<tr>
+<td>3</td>
+<td>(t_idx, h_idx, w_idx)</td>
+<td>3 个 <code>[6]</code></td>
+<td>t 最外、h 其次、w 最内：h = 0,0,1,1,2,2；w = 0,1,0,1,0,1</td>
+</tr>
+<tr>
+<td>4</td>
+<td>块 = stack + start</td>
+<td><code>[3, 6]</code> long</td>
+<td>start = 2，三行都加 2</td>
+</tr>
+<tr>
+<td>5</td>
+<td>新 start</td>
+<td>int</td>
+<td>块的最大值（三轴一起取）+ 1 = 4 + 1 = 5</td>
+</tr>
+<tr>
+<td>6</td>
+<td>文本块</td>
+<td><code>[3, n]</code></td>
+<td>start + arange(n) 复制成三行</td>
+</tr>
+<tr>
+<td>7</td>
+<td>positions</td>
+<td><code>[3, 14]</code> long</td>
+<td>所有块沿 dim=1 拼起来</td>
+</tr>
+<tr>
+<td>8</td>
+<td>delta</td>
+<td>int</td>
+<td>(10 + 1) − 14 = −3，存进请求状态</td>
+</tr>
+<tr>
+<td>9</td>
+<td>decode_position(i, delta)</td>
+<td>(3,) long</td>
+<td>i = 14 → [11, 11, 11]，紧接 prefill 的最大位置 10</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li><code>start += token 数</code>：纯文本时正确，有图像就错。</li>
+<li>h、w 互换 / 展开顺序错：方形网格看不出来，一定要用矩形网格（如 3×2）和 t &gt; 1 自测；meshgrid 要 <code>indexing=&quot;ij&quot;</code>。</li>
+<li>只看某一个轴的 max：最大值可能来自 t（视频）、h（高图）或 w（宽图）。</li>
+<li>delta 少了 +1，或 decode 时直接用 index 当位置：第一个 decode 位置应该是 max+1。</li>
+<li>空段（n = 0 或网格为 0）没有 max，不能用它更新 start；没有任何段时返回 <code>[3, 0]</code> 的 long tensor。</li>
+<li>dtype：位置是整数下标，用 <code>torch.long</code>。</li>
+</ul>
+<h2 id="s5">逐步图：例 1（图像在开头 + 矩形网格，spatial_merge=2）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ segments = [(&quot;image&quot;, (2, 4, 6)), (&quot;text&quot;, 2)]</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 图像网格</div><p>LLM 网格 = (t=2, h=4//2=2, w=6//2=3) → 12 个 token，t-major，再 h，再 w。</p>
+</div><div class="step" data-hl=""><div class="step-title">2. 三行位置（start = 0）</div><p>t：<span class="cells"><span class="cell t">0</span><span class="cell t">0</span><span class="cell t">0</span><span class="cell t">0</span><span class="cell t">0</span><span class="cell t">0</span><span class="cell t">1</span><span class="cell t">1</span><span class="cell t">1</span><span class="cell t">1</span><span class="cell t">1</span><span class="cell t">1</span></span></p>
+<p>h：<span class="cells"><span class="cell h">0</span><span class="cell h">0</span><span class="cell h">0</span><span class="cell h">1</span><span class="cell h">1</span><span class="cell h">1</span><span class="cell h">0</span><span class="cell h">0</span><span class="cell h">0</span><span class="cell h">1</span><span class="cell h">1</span><span class="cell h">1</span></span></p>
+<p>w：<span class="cells"><span class="cell w">0</span><span class="cell w">1</span><span class="cell w">2</span><span class="cell w">0</span><span class="cell w">1</span><span class="cell w">2</span><span class="cell w">0</span><span class="cell w">1</span><span class="cell w">2</span><span class="cell w">0</span><span class="cell w">1</span><span class="cell w">2</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">3. 下一段的 start</div><p>图像段最大位置 = <strong>2（来自 w 轴）</strong> → 下一段 start = 3（不是 12！）</p>
+</div><div class="step" data-hl=""><div class="step-title">4. 文本段</div><p><span class="cells"><span class="cell t">3</span><span class="cell t">4</span></span>（三轴相同）</p>
+</div><div class="step" data-hl=""><div class="step-title">5. delta 与 decode</div><p>T = 14，max = 4，delta = (4+1) − 14 = <strong>−9</strong></p>
+<p><code>decode_position(14, -9) = [5, 5, 5]</code>，<code>decode_position(15, -9) = [6, 6, 6]</code></p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>例 1 见逐步图。</p>
+<p><strong>例 2：时间维很长的图像（视频帧）</strong>：<code>[(&quot;text&quot;,1), (&quot;image&quot;,(4,2,2)), (&quot;text&quot;,1)]</code> → 网格 (4,1,1)：</p>
+<pre><code>t: 0 | 1 2 3 4 | 5
+h: 0 | 1 1 1 1 | 5
+w: 0 | 1 1 1 1 | 5
+T = 6, max = 5, delta = 0        # t 轴推进了 4，正好等于 token 数
+</code></pre>
+<p>delta 为 0 不代表“没有图像”，只代表位置跨度恰好等于 token 数。</p>
+<p><strong>例 3：两张图紧挨着</strong>：<code>[(&quot;text&quot;,1), (&quot;image&quot;,(1,4,4)), (&quot;image&quot;,(1,2,4)), (&quot;text&quot;,1)]</code>，merge=2：</p>
+<pre><code>t: 0 | 1 1 1 1 | 3 3 | 5
+h: 0 | 1 1 2 2 | 3 3 | 5
+w: 0 | 1 2 1 2 | 3 4 | 5          T=8, max=5, delta=-2
+</code></pre>
+<p>第二张图的 start = 3：第一张图最大位置是 2，不是“已有 token 数 5”。<code>[(&quot;image&quot;,(1,2,4))]</code>，merge=1 → 网格 (1,2,4)，8 个 token：t 全 0；h = 0 0 0 0 1 1 1 1；w = 0 1 2 3 0 1 2 3；T=8, max=3, delta=−4。</p>
+<h4>关键问题</h4>
+<ol>
+<li>一个 (t, h, w) 的图像段在 LLM 序列里占几个 token？h 不能被 spatial_merge 整除时会怎样？</li>
+<li>第 k 个图像 token 的 (t_idx, h_idx, w_idx) 怎么由 k 算出来？</li>
+<li>每段结束后 start 更新成什么？为什么不是“目前为止的 token 数”？</li>
+<li>图像段的“最大位置”可能出现在哪个轴上？例 1 是哪个？</li>
+<li>delta 什么时候为负、为 0、为正？</li>
+<li>decode 时第 i 个 token 的位置为什么三轴相同？decode_position 返回什么形状和 dtype？</li>
+<li><code>(&quot;text&quot;, 0)</code> 这种空段该如何处理？</li>
+</ol>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>整体结构</strong>：维护 <code>start = 0</code> 和 parts 列表；逐段生成 <code>[3, n_seg]</code> 块并 append；每段之后用这一块的最大值更新 start；最后 <code>torch.cat(parts, dim=1)</code>，再算 delta。</li>
+<li><strong>文本段</strong>：<code>idx = start + arange(n)</code>，再变成 3 行（<code>expand(3, n)</code> / <code>repeat</code> / <code>stack([idx]*3)</code>）。expand 得到 view，后面 cat 会拷贝。</li>
+<li><strong>图像段</strong>：<code>gh, gw = h // m, w // m</code>；<code>torch.meshgrid(arange(t), arange(gh), arange(gw), indexing=&quot;ij&quot;)</code> 后各自 flatten——ij 索引 + 行主序 flatten 天然就是 t-major、再 h、再 w。或用 view/expand 广播。</li>
+<li><strong>start 更新</strong>：<code>start = block.max() + 1</code>（转 int）；空块跳过。</li>
+<li><strong>空输入</strong>：segments 为空时返回 <code>torch.zeros(3, 0, dtype=torch.long)</code> 与 delta=0。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案与逐段追踪<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li><code>t · (h//m) · (w//m)</code> 个；不能整除时向下取整（真实模型里 h、w 总是 merge 的倍数）。</li>
+<li>令 hw = gh·gw：<code>t_idx = k // hw</code>，<code>h_idx = (k % hw) // gw</code>，<code>w_idx = k % gw</code>。</li>
+<li>start = 所有已生成位置的最大值 + 1。图像的位置跨度 = max(t, gh, gw) 而非 token 数。</li>
+<li>取决于 t、gh、gw 谁最大；例 1 中 gw=3 最大，最大位置 2 来自 w 轴。</li>
+<li>有图像且 t·gh·gw &gt; max(t,gh,gw) 时为负；只有文本，或图像退化成一条线（例 2）时为 0；不可能为正。</li>
+<li>decode 只产生文本 token，文本三轴相同；返回 (3,) long。</li>
+<li>跳过，不更新 start（也不必加入 parts）。</li>
+</ol>
+</div></details>
+<p><strong>逐段追踪（例 3 第一组）</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>段</th>
+<th>start(进入)</th>
+<th>网格/长度</th>
+<th>块 (t / h / w)</th>
+<th>块 max</th>
+<th>start(离开)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>text 1</td>
+<td>0</td>
+<td>1</td>
+<td>0/0/0</td>
+<td>0</td>
+<td>1</td>
+</tr>
+<tr>
+<td>image (1,4,4)</td>
+<td>1</td>
+<td>1×2×2</td>
+<td>1111 / 1122 / 1212</td>
+<td>2</td>
+<td>3</td>
+</tr>
+<tr>
+<td>image (1,2,4)</td>
+<td>3</td>
+<td>1×1×2</td>
+<td>33 / 33 / 34</td>
+<td>4</td>
+<td>5</td>
+</tr>
+<tr>
+<td>text 1</td>
+<td>5</td>
+<td>1</td>
+<td>5/5/5</td>
+<td>5</td>
+<td>6</td>
+</tr>
+</tbody>
+</table></div>
+<p>T = 8，max = 5，delta = 6 − 8 = −2；下一个 decode token（index 8）位置 = 6。</p>
+<p><strong>自检</strong>：例 1（矩形 + 多帧）检查 h/w 没有互换；例 3 检查第二张图从 3 开始；<code>pos.dtype == torch.long</code>、<code>pos.shape == (3, T)</code>；任意输入下 <code>decode_position(T, delta)</code> 的值应等于 <code>pos.max() + 1</code>。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>Qwen2.5-Omni 的 TMRoPE 如何按秒交错音频和视频？</li>
+</ul>
+<p>对照源码：<code>model_executor/models/qwen2_5_omni/qwen2_5_omni.py:412-576</code> · <code>model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py:1694-1785</code></p>
+<nav class="pager"><a class="prev" href="p14_overview.html"><small>← 上一题</small>#23 · P14 Codec 窗口规划：首块小、后块大、左上下文</a><a class="next" href="p16_overview.html"><small>下一题 →</small>#25 · P16 启动规划：设备分组、并行初始化、回滚、准入</a></nav>
+</main>
+</body>
+</html>

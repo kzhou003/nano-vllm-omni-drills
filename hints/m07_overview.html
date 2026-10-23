@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M07 提示 · 按 stage 加载与打包权重</title>
+<meta name="description" content="一个 Qwen3-Omni checkpoint 同时装着 thinker、talker、code2wav 的权重；每个 stage 进程只该打开自己的 shard、只取自己的张量，并把 q/k/v、gate/up、各 expert 打包成 kernel 友好的布局。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="m06_overview.html">← <span class="lbl">M06</span></a><a href="m08_overview.html"><span class="lbl">M08</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#7 · Track M · Qwen-Omni 模型实现 · 书 p.41</div>
+<h1>M07 · 按 stage 加载与打包权重</h1>
+<p class="lede">一个 Qwen3-Omni checkpoint 同时装着 thinker、talker、code2wav 的权重；每个 stage 进程只该打开自己的 shard、只取自己的张量，并把 q/k/v、gate/up、各 expert 打包成 kernel 友好的布局。</p>
+<div class="badges">
+<span class="badge">⏱ <b>45 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/m07_stage_weight_loading.py</code></span>
+<span class="badge">验收 <code>./check.sh m07</code></span>
+<span class="badge">提示 <b>A-7</b> · 参考解 <b>C-7</b> <code>solutions/m07_stage_weight_loading.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="M07">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：pack_layer 的记账</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：三个 stage 进程各自加载同一个 checkpoint 目录。vllm-omni 的做法：同一个 wrapper 类按 <code>model_stage</code> 只构建一个子模块，<code>load_weights</code> 按前缀 <code>thinker.</code> / <code>talker.</code> / <code>code2wav.</code> 分流。本题更进一步：根据 <code>model.safetensors.index.json</code> 的 <code>weight_map</code> 只打开相关 shard。</li>
+<li><strong>打包布局（vLLM 风格）</strong>：</li>
+</ul>
+<pre><code>qkv    = cat([q_proj, k_proj, v_proj], dim=0)   # [(H + 2·KVH)·D, hidden]   一次 GEMM 出三者
+w13    = stack_e cat([gate_e, up_e], dim=0)     # [E, 2I, hidden]   FusedMoE 的 w1/w3
+w2     = stack_e down_e                         # [E, hidden, I]
+router = mlp.gate.weight                        # [E, hidden]
+</code></pre>
+<ul>
+<li>key 形如 <code>thinker.model.layers.{i}.self_attn.q_proj.weight</code>、<code>thinker.model.layers.{i}.mlp.experts.{e}.gate_proj.weight</code>、<code>thinker.model.layers.{i}.mlp.gate.weight</code>。</li>
+<li><strong>完整性检查</strong>：“少加载一个张量”在 PyTorch 里不报错——参数保持随机初始化，输出悄悄变成噪声。所以缺 key、多 key、expert 编号不连续、某个 expert 缺 gate/up/down，都必须抛 <code>LoadError</code>。</li>
+</ul>
+<p><strong>要实现</strong>：<code>shards_for_stage(weight_map, stage)</code>、<code>select_stage(state, stage, strip)</code>、<code>pack_layer(sd, i)</code>、<code>load_thinker_text(state, num_layers)</code>。</p>
+<p><strong>验收要点</strong>：只挑本 stage 的 shard · select_stage 去前缀且丢弃其他 stage · 打包后的 qkv / w13 / w2 复现 HF 投影与 expert 输出 · 缺失与多余 key 都报错。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">合租仓库搬家</div><p>三户人家的东西存在同一个仓库、分装在若干大箱子（shard）里，每件物品贴着“户名.房间.物品”的标签（key）。门口有一张总清单（weight_map）。搬家时每户只拉装有自家东西的箱子——有的箱子混着两户的东西，两户都得拉。开箱后只拿标签以自家户名开头的物品，并把“户名.”撕掉。标签必须<strong>连同那个点一起比</strong>：<code>thinker</code> 和 <code>thinker_extra</code> 前几个字一样，但不是一家人。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">钥匙串与装箱单</div><p>q、k、v 三把钥匙开同一扇门（输入都是 hidden），串到一个钥匙圈上（<code>cat(dim=0)</code>），开门一次动作（一次 GEMM），再按 <code>[H·D, KVH·D, KVH·D]</code> 分开。gate / up 同理串成 w13——顺序约定好：<strong>先 gate 后 up</strong>，串反了照样插得进去，只是开错了门。搬完拿装箱单逐项打勾（<code>used</code> 集合）：没打勾的（多余 key）和找不到的（缺失 key）都要喊停。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<p>tiny 随机 thinker（hidden=64，H=4，KVH=2，D=16，E=6，I=32），第 0 层（实测）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>HF key（去前缀后）</th>
+<th>HF 形状</th>
+<th>打包后</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>self_attn.{q,k,v}_proj.weight</code></td>
+<td><code>[64,64]</code>、<code>[32,64]</code>、<code>[32,64]</code></td>
+<td>qkv <code>[128, 64]</code></td>
+<td>沿 dim 0 拼：64 + 32 + 32 = (4 + 2·2)·16；<code>(x @ qkv.T).split([64,32,32])</code> 的 q 与 HF 最大差 0.0</td>
+</tr>
+<tr>
+<td><code>mlp.experts.{e}.gate_proj / up_proj</code></td>
+<td><code>[32, 64]</code> ×2 ×6</td>
+<td>w13 <code>[6, 64, 64]</code></td>
+<td>每个 expert 内 cat，再按 e = 0..5 stack</td>
+</tr>
+<tr>
+<td><code>mlp.experts.{e}.down_proj</code></td>
+<td><code>[64, 32]</code> ×6</td>
+<td>w2 <code>[6, 64, 32]</code></td>
+<td>按 e stack</td>
+</tr>
+<tr>
+<td><code>mlp.gate.weight</code></td>
+<td><code>[6, 64]</code></td>
+<td>router <code>[6, 64]</code></td>
+<td>名字叫 gate，但它是 <strong>router</strong>，不是 gate_proj</td>
+</tr>
+<tr>
+<td>norm × 4、o_proj</td>
+<td>原样</td>
+<td>原样</td>
+<td>input_layernorm / post_attention_layernorm / q_norm / k_norm</td>
+</tr>
+<tr>
+<td>层外</td>
+<td><code>embed_tokens.weight</code>、<code>norm.weight</code></td>
+<td></td>
+<td>tiny 模型共 56 个 key：2 个层外 + 2 层 × 27 个</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>stage 前缀不带点：<code>&quot;thinkers.x&quot;</code>、<code>&quot;talker2.x&quot;</code> 被误判。</li>
+<li>层前缀不带点（<code>&quot;layers.1&quot;</code>）→ 第 1 层吞掉 <code>layers.10..19</code> 的 key，然后报“多余 key”或 expert 冲突。</li>
+<li>用 <code>str.replace</code> 去前缀：可能替换掉中间的子串；应 <code>startswith</code> + 切片。</li>
+<li>w13 拼成 <code>[up | gate]</code> → 形状对但 SiLU 用在了错误的那一半，expert 输出全错。</li>
+<li>按 dict 遍历顺序 stack expert → id 乱序时 expert 被错配；expert id 若按字符串排序会得到 0, 1, 10, 11, 2…</li>
+<li>“多余 key”检查放在所有 take 之前 → 把还没被 take 的合法 key 误报为多余。</li>
+<li>把 <code>thinker.lm_head.weight</code> 当成错误：它不在 <code>thinker.model.</code> 下，M08 单独取。</li>
+</ul>
+<h2 id="s5">逐步图：pack_layer 的记账</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ H=2, KVH=1, D=2, hidden=4, E=2, I=3（每个张量填常数便于看来源）</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 切出本层子字典</div><p><code>p = &quot;layers.0.&quot;</code>（带结尾点）；<code>sub = {去前缀后的 key: tensor}</code>，之后所有操作都在 sub 上，key 变成 <code>self_attn.q_proj.weight</code> 这样的短名。</p>
+<p><code>sd</code> 里同时存在 <code>layers.1.*</code> 也没关系。</p>
+</div><div class="step" data-hl=""><div class="step-title">2. 收集 expert（正则 + used）</div><p><code>^mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$</code></p>
+<pre><code>experts = {0: {gate_proj, up_proj, down_proj}, 1: {gate_proj, up_proj, down_proj}}
+used += 这 6 个 key
+</code></pre>
+<p>检查：非空、<code>sorted(experts) == list(range(len(experts)))</code>、每个 expert 的 proj 集合恰好是三种。</p>
+</div><div class="step" data-hl=""><div class="step-title">3. take 必需字段，打包</div><pre><code>qkv [8, 4]     第 0 列 = [1, 1, 1, 1, 2, 2, 3, 3]          # q 4 行 | k 2 行 | v 2 行
+w13 [2, 6, 4]  w13[:, :, 0] = [[1, 1, 1, 2, 2, 2],
+                               [11, 11, 11, 12, 12, 12]]   # 每个 expert：gate 3 行 | up 3 行
+w2  [2, 4, 3]  w2[:, 0, 0] = [3, 13]
+router [2, 4]
+</code></pre>
+<p>（q 填 1、k 填 2、v 填 3；expert e 的 gate/up/down 填 10e+1 / 10e+2 / 10e+3）</p>
+</div><div class="step" data-hl=""><div class="step-title">4. 最后检查多余 key</div><p><code>unexpected = set(sub) - used</code>，非空就 LoadError。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>修改</th>
+<th><code>pack_layer(sd, 0)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原样</td>
+<td>成功</td>
+</tr>
+<tr>
+<td>额外加入 expert 3（id 变成 0,1,3）</td>
+<td>LoadError（id 不连续）</td>
+</tr>
+<tr>
+<td>删掉 <code>mlp.experts.1.down_proj.weight</code></td>
+<td>LoadError（expert 1 不完整）</td>
+</tr>
+<tr>
+<td>加入 <code>layers.0.self_attn.rotary_emb.inv_freq</code></td>
+<td>LoadError（多余 key）</td>
+</tr>
+<tr>
+<td>删掉 <code>layers.0.self_attn.k_norm.weight</code></td>
+<td>LoadError（缺 key）</td>
+</tr>
+<tr>
+<td>加入 <code>layers.10.input_layernorm.weight</code></td>
+<td>成功（那是第 10 层）</td>
+</tr>
+</tbody>
+</table></div>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>shards_for_stage</strong>：</p>
+<pre><code>weight_map = {
+  &quot;thinker.model.embed_tokens.weight&quot;:      &quot;model-00001.safetensors&quot;,
+  &quot;thinker.model.layers.0.mlp.gate.weight&quot;: &quot;model-00002.safetensors&quot;,
+  &quot;talker.model.codec_embedding.weight&quot;:    &quot;model-00002.safetensors&quot;,
+  &quot;talker.code_predictor.lm_head.0.weight&quot;: &quot;model-00003.safetensors&quot;,
+  &quot;code2wav.decoder.0.conv.weight&quot;:         &quot;model-00003.safetensors&quot;,
+  &quot;thinker.lm_head.weight&quot;:                 &quot;model-00004.safetensors&quot;,
+}
+shards_for_stage(weight_map, &quot;thinker&quot;)  -&gt; [&quot;model-00001…&quot;, &quot;model-00002…&quot;, &quot;model-00004…&quot;]
+shards_for_stage(weight_map, &quot;talker&quot;)   -&gt; [&quot;model-00002…&quot;, &quot;model-00003…&quot;]
+shards_for_stage(weight_map, &quot;code2wav&quot;) -&gt; [&quot;model-00003…&quot;]
+</code></pre>
+<p>同一个 shard 可同时属于两个 stage；结果去重并排序。<code>thinker.lm_head.*</code> 也属于 thinker stage。</p>
+<p><strong>select_stage(state, &quot;thinker&quot;, &quot;thinker.model.&quot;)</strong>：keys <code>thinker.model.norm.weight</code>、<code>thinker.model.layers.0.input_layernorm.weight</code>、<code>thinker.lm_head.weight</code>、<code>talker.model.norm.weight</code>、<code>thinkers.model.x</code> → <code>{&quot;layers.0.input_layernorm.weight&quot;, &quot;norm.weight&quot;}</code>。值原样保留，只改 key。</p>
+<p><strong>load_thinker_text</strong>：多一个 <code>thinker.model.rotary_emb.inv_freq</code> → LoadError；num_layers 比实际多 → 那层什么都没有 → LoadError；<code>thinker.lm_head.weight</code> 和 <code>talker.*</code> 存在不算错误。</p>
+<h4>关键问题</h4>
+<ol>
+<li>判断 key 属于哪个 stage 该用哪个前缀？为什么 <code>&quot;thinker&quot;</code>（不带点）不够安全？</li>
+<li>去前缀时 <code>&quot;thinker.model.norm.weight&quot;</code> 变成什么？<code>&quot;thinker.lm_head.weight&quot;</code> 会怎样？</li>
+<li>收集第 i 层为什么必须用 <code>&quot;layers.{i}.&quot;</code>（带结尾点）？i=1 时不带点会误收哪些层？</li>
+<li>qkv 的行数是多少？为什么沿 dim 0 拼而不是 dim 1？</li>
+<li>w13 是先对每个 expert <code>cat(gate, up)</code> 再 stack，还是先 stack 所有 gate 再和 up 拼？</li>
+<li>如何判断 expert id “恰好是 0..E-1 且完整”？E 从哪里得知？</li>
+<li>“多余 key”怎么检测？需要记录哪些 key 已被使用？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>stage 级前缀（<code>&quot;thinker.&quot;</code>）vs strip 前缀（<code>&quot;thinker.model.&quot;</code>）：用 <code>startswith</code> + <code>k[len(strip):]</code>。</li>
+<li><code>nn.Linear.weight</code> 是 <code>[out, in]</code>，多个共享输入的 Linear 合并就是在 out 维（行）上拼。</li>
+<li>PackedLayer 的 9 个字段与 HF key 一一对应；<code>mlp.gate.weight</code> 是 router。</li>
+<li>load_thinker_text 返回的第一个元素是 <code>{&quot;embed_tokens&quot;: ..., &quot;norm&quot;: ...}</code>（key 里没有 <code>.weight</code>）。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>shards_for_stage</strong>：一行集合推导，<code>sorted(set)</code>。</li>
+<li><strong>pack_layer</strong>：切出 sub；小助手 <code>take(name)</code>：不存在 raise LoadError，存在就记入 used 并返回。expert key 匹配成功时也加入 used。</li>
+<li><strong>收集 experts</strong>：<code>experts.setdefault(int(id), {})[proj] = v</code>；检查非空、连续、三种 proj 齐全；E = <code>len(experts)</code>。</li>
+<li><strong>打包</strong>：<code>qkv = cat([q, k, v], 0)</code>；<code>w13 = stack([cat([gate_e, up_e], 0) for e in range(E)])</code>；<code>w2 = stack([down_e ...])</code>。按 e = 0..E-1 的顺序。</li>
+<li><strong>顺序陷阱</strong>：多余 key 检查必须在所有 take 之后。</li>
+<li><strong>load_thinker_text</strong>：<code>select_stage(state, &quot;thinker&quot;, &quot;thinker.model.&quot;)</code> → 对 <code>range(num_layers)</code> 调 pack_layer → 检查非 <code>layers.</code> 开头的 key 集合恰好是 <code>{embed_tokens.weight, norm.weight}</code>。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案与自检<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li><code>STAGE_PREFIX[stage]</code>（带点）；不带点会让 <code>&quot;thinkers.x&quot;</code>、<code>&quot;talker2.x&quot;</code> 被误判。</li>
+<li><code>&quot;norm.weight&quot;</code>；<code>thinker.lm_head.weight</code> 不以 strip 开头，被丢弃。</li>
+<li><code>&quot;layers.1&quot;</code> 会匹配 <code>layers.1x.*</code>（10–19）、<code>layers.1xx.*</code>；带点只匹配第 1 层。</li>
+<li>(H + 2·KVH)·D；三者 in 相同、out 不同，合并输出就是沿 dim 0 拼。</li>
+<li>每个 expert 内 <code>cat(gate, up)</code> 再 stack → <code>[E, 2I, hidden]</code>。先分别 stack 再沿 dim 1 拼结果相同；沿 dim 0 拼会变成 <code>[2E, I, hidden]</code>，错误。</li>
+<li>E = 收集到的不同 id 数；条件 <code>sorted(ids) == list(range(E))</code> 且 E &gt; 0，每个 id 都有三种 proj。</li>
+<li>维护 used 集合，所有字段取完后 <code>set(sub) - used</code>。</li>
+</ol>
+</div></details>
+<p><strong>自检：打包后是否等价</strong></p>
+<pre><code class="language-python">x = torch.randn(5, hidden)
+q, k, v = (x @ L.qkv.T).split([H*D, KVH*D, KVH*D], dim=-1)   # q 应等于 x @ q_proj.T
+g, u = (x @ L.w13[e].T).chunk(2, dim=-1)
+y = (F.silu(g) * u) @ L.w2[e].T                              # 应等于 expert e 的 SwiGLU 输出
+</code></pre>
+<p>这也正是 M08 把 PackedLayer 还原成 M02/M03 权重的方式：qkv 按行 split，w13 按第 1 维对半切。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>TP=2 时 qkv 怎么切？为什么不能简单地按行对半切打包后的 qkv？</li>
+<li>talker 进程为什么还需要 thinker 的部分权重（Qwen2.5-Omni 的 embed_tokens）？</li>
+</ul>
+<p>对照源码：<code>model_executor/models/qwen3_omni/qwen3_omni.py:1725-1783</code> · <code>model_executor/models/qwen3_omni/qwen3_omni_moe_talker.py:61-77</code> · <code>model_executor/models/qwen2_5_omni/qwen2_5_omni.py:1009-1022</code> · HF <code>Qwen3OmniMoeThinkerTextModel.state_dict()</code></p>
+<nav class="pager"><a class="prev" href="m06_overview.html"><small>← 上一题</small>#6 · M06 Code2Wav 的流式因果卷积与转置卷积</a><a class="next" href="m08_overview.html"><small>下一题 →</small>#8 · M08 串起来：tiny thinker 的 KV-cache greedy 解码</a></nav>
+</main>
+</body>
+</html>

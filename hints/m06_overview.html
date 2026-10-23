@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M06 提示 · Code2Wav 的流式因果卷积与转置卷积</title>
+<meta name="description" content="Code2Wav 把 codec 上采样成波形，核心是因果 Conv1d 与因果 ConvTranspose1d；流式解码要求任意分块拼起来与整段处理逐样本一致，且每个样本一旦“确定”就立刻吐出。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="m05_overview.html">← <span class="lbl">M05</span></a><a href="m07_overview.html"><span class="lbl">M07</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#6 · Track M · Qwen-Omni 模型实现 · 书 p.38</div>
+<h1>M06 · Code2Wav 的流式因果卷积与转置卷积</h1>
+<p class="lede">Code2Wav 把 codec 上采样成波形，核心是因果 Conv1d 与因果 ConvTranspose1d；流式解码要求任意分块拼起来与整段处理逐样本一致，且每个样本一旦“确定”就立刻吐出。</p>
+<div class="badges">
+<span class="badge">⏱ <b>60 min</b></span>
+<span class="badge diff-难">难度 <b>难</b></span>
+<span class="badge">实现 <code>mine/m06_streaming_causal_conv.py</code></span>
+<span class="badge">验收 <code>./check.sh m06</code></span>
+<span class="badge">提示 <b>A-6</b> · 参考解 <b>C-6</b> <code>solutions/m06_streaming_causal_conv.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="M06">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：转置卷积的 acc / base（K=4, s=2, weight=[1,2,3,4], bias=0.5）</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：stage 2（Code2Wav）把 <code>[B, 16, T]</code> 的 codes 变成 <code>[B, 1, T·upsample]</code> 的波形：embedding 平均 → 滑窗 transformer → 因果转置卷积上采样 → ConvNeXt → 多级（因果卷积 + SnakeBeta）解码。vllm-omni 默认用“左上下文重算再切片”的无状态方案（P14）；本题练另一种——<strong>带状态的流式卷积</strong>，是理解两种方案取舍的关键。</li>
+<li><strong>因果 Conv1d（stride 1）</strong>：离线模块在整段左边补 (K-1)·d 个 0，输出长度 = 输入长度，第 t 个输出只依赖输入 ≤ t。流式版只需保存最近 (K-1)·d 个输入作为状态，每次拼到新块前面再卷积。</li>
+<li><strong>因果 ConvTranspose1d（stride s，kernel K）</strong>：</li>
+</ul>
+<pre><code>输入帧 i 写入输出位置 [i·s, i·s + K)（重叠相加）
+离线：y = conv_transpose(x)，长度 (L-1)·s + K，再裁掉开头 K-s 和结尾 K-s 个样本
+流式：收到 n 帧后，位置 &lt; n·s 的样本不会再被后续帧修改 → 可以输出
+      （再减去全局开头裁掉的 K-s 个）；flush 时输出剩余部分并裁掉结尾 K-s 个
+</code></pre>
+<ul>
+<li><strong>bias 只能在输出时加一次</strong>；每块卷积都带 bias，重叠区会被加两次。</li>
+<li><strong>“尽早输出”验收</strong>：喂入第 n 帧后，累计输出必须正好是 <code>max(0, n·s − (K−s))</code> 个——多了说明输出了未确定的样本，少了说明增加了不必要的延迟（直接影响首包音频延迟 TTFP）。</li>
+</ul>
+<p><strong>验收要点</strong>：因果卷积任意分块与离线一致、每块输出数等于输入数（含 dilation、K=1）· 转置卷积任意分块 + flush 与离线一致（多种 K/s）· 每喂 1 帧后的累计输出数恰好是理论最早值。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">因果卷积 = 带一张“便签”的抄写员</div><p>抄写员每写一个字都要回头看前面 (K-1)·d 个字。稿纸一页页送来，翻页时前一页已收走——所以翻页前他把最后 (K-1)·d 个字抄在便签上，贴到下一页最前面。第一页之前的便签是空白（全 0），正好等于离线版“左边补 0”。注意：新的一页很短（比便签还短）时，新便签要从“旧便签 + 新页”连起来的末尾抄，而不是只从新页里抄。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">转置卷积 = 每隔 s 格盖一个宽 K 的印章</div><p>每来一帧就在长纸条上从第 i·s 格开始盖一个宽 K 格的印章；K &gt; s 时相邻两章叠印 K-s 格。一格什么时候能剪下来？当以后再也不会有章盖到它：已来了 n 帧，下一个章最早从 n·s 盖起，所以 &lt; n·s 的格子都定稿了。纸的底色（bias）只能刷一次。离线版还会把纸条两头各剪掉 K-s 格：开头那刀只剪一次（全局位置），结尾那刀要等收工（flush）才知道在哪。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>张量</th>
+<th>形状</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conv · 首块前</td>
+<td>state</td>
+<td><code>[B, C_in, (K-1)·d]</code></td>
+<td>全 0；B / dtype / device 第一次 step 才知道，所以懒创建</td>
+</tr>
+<tr>
+<td>Conv · step</td>
+<td><code>buf = cat([state, x], -1)</code></td>
+<td><code>[B, C_in, (K-1)·d + t]</code></td>
+<td>“便签 + 新页”</td>
+</tr>
+<tr>
+<td></td>
+<td><code>F.conv1d(buf, w, b, dilation=d)</code></td>
+<td><code>[B, C_out, t]</code></td>
+<td>无 padding：长度减 (K-1)·d，正好剩 t</td>
+</tr>
+<tr>
+<td></td>
+<td>新 state</td>
+<td><code>[B, C_in, (K-1)·d]</code></td>
+<td>从 <strong>buf</strong> 的末尾取</td>
+</tr>
+<tr>
+<td>TransConv · step</td>
+<td><code>F.conv_transpose1d(x, w, None, stride=s)</code></td>
+<td><code>[B, C_out, (t-1)·s + K]</code></td>
+<td>块内叠印已做好；覆盖全局 <code>[frames·s, frames·s + len)</code></td>
+</tr>
+<tr>
+<td></td>
+<td>acc（从全局 base 开始）</td>
+<td><code>[B, C_out, ≤ K-s]</code></td>
+<td>块间叠印：新结果加到 acc 对应位置</td>
+</tr>
+<tr>
+<td></td>
+<td>输出</td>
+<td><code>[B, C_out, ·]</code></td>
+<td>全局 <code>[base, frames·s)</code>，加 bias 一次，去掉落在 <code>[0, K-s)</code> 里的部分</td>
+</tr>
+<tr>
+<td>TransConv · flush</td>
+<td>输出</td>
+<td><code>[B, C_out, ·]</code></td>
+<td>剩余 pending 全部定稿，去掉结尾 K-s 个（通常恰好全被裁掉）</td>
+</tr>
+<tr>
+<td>累计</td>
+<td>喂入 n 帧后已输出</td>
+<td><code>max(0, n·s − (K−s))</code></td>
+<td>K = 2s 时就是 (n-1)·s</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>state 从 x 末尾取：块长 &lt; context 时 state 变短，下一块输出个数不对。</li>
+<li>K=1（context=0）时 <code>buf[..., -0:]</code> 等于整个 buf → state 无限增长、输出越来越多。</li>
+<li>bias 进了每块卷积 → 重叠区多出 bias（例 3 中所有值多 0.5）。</li>
+<li>左裁剪按块做 → 后面每块都少 K-s 个样本，总长度不对。</li>
+<li>输出了 ≥ frames·s 的位置 → 那些值之后还会被加，与离线不一致；输出太少 → 结果仍可能对，但“尽早输出”计数对不上。</li>
+<li>K == s 时右裁剪写 <code>t[..., :-0]</code> 得到空张量。</li>
+<li>from_hf 里转置卷积的 stride 是 <code>m.conv.stride[0]</code>（tuple）。</li>
+</ul>
+<h2 id="s5">逐步图：转置卷积的 acc / base（K=4, s=2, weight=[1,2,3,4], bias=0.5）</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ x = [1, 10, 100]，逐帧 step</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 离线答案</div><pre><code>位置:        0    1    2    3    4     5     6     7
+帧0 (1):     1    2    3    4
+帧1 (10):              10   20   30    40
+帧2 (100):                       100   200   300   400
+求和+bias:  1.5  2.5  13.5 24.5 130.5 240.5 300.5 400.5   （长度 (3-1)·2+4 = 8）
+裁掉开头 2、结尾 2 -&gt; [13.5, 24.5, 130.5, 240.5]
+</code></pre>
+</div><div class="step" data-hl=""><div class="step-title">2. step(帧0)</div><p>本块卷积覆盖全局 [0,4) = 1,2,3,4；frames = 1；可定稿 [0, 2)——但它们<strong>全在左裁剪 [0, 2) 内</strong>。</p>
+<p>输出 <code>[]</code>；base → 2；acc（未加 bias）= <span class="cells"><span class="cell ">3</span><span class="cell ">4</span></span>（位置 2,3）</p>
+</div><div class="step" data-hl=""><div class="step-title">3. step(帧1)</div><p>[2,6) += 10,20,30,40 → acc = <span class="cells"><span class="cell on">13</span><span class="cell on">24</span><span class="cell ">30</span><span class="cell ">40</span></span>；frames = 2；定稿 [2, 4)。</p>
+<p>输出 <code>[13.5, 24.5]</code>（加 bias 一次）；base → 4；acc = <span class="cells"><span class="cell ">30</span><span class="cell ">40</span></span></p>
+</div><div class="step" data-hl=""><div class="step-title">4. step(帧2)</div><p>[4,8) += 100..400 → acc = <span class="cells"><span class="cell on">130</span><span class="cell on">240</span><span class="cell ">300</span><span class="cell ">400</span></span>；frames = 3；定稿 [4, 6)。</p>
+<p>输出 <code>[130.5, 240.5]</code>；base → 6；acc = <span class="cells"><span class="cell ">300</span><span class="cell ">400</span></span>——位置 6,7 还在等未来帧。</p>
+</div><div class="step" data-hl=""><div class="step-title">5. flush()</div><p>total = (3-1)·2 + 4 = 8，定稿 [6, 8) 后去掉右侧 2 个 → 输出 <code>[]</code>。</p>
+<p>acc 的长度始终 ≤ K-s：它就是“还在等后续帧”的尾巴。累计输出数 0, 2, 4 = <code>max(0, 2n − 2)</code> ✓</p>
+</div><div class="step" data-hl=""><div class="step-title">6. 两种 bug 的样子</div><ul>
+<li><strong>每帧单独带 bias 卷积再重叠相加</strong>：重叠位置 bias 加两次 → <code>[14.0, 25.0, 131.0, 241.0]</code>（每个多 0.5）。</li>
+<li><strong>左裁剪按块做</strong>：用 [2,1] 分块时，第二块 <code>[130.5, 240.5]</code> 会被错误地裁掉 2 个变成 <code>[]</code>。</li>
+</ul>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p><strong>例 1：因果 Conv1d</strong>，K=3，d=1，weight=[1,2,3]，bias=0：</p>
+<pre><code>x = [1, 2, 3, 4, 5]
+离线：左补 2 个 0 → y[t] = 1·x[t-2] + 2·x[t-1] + 3·x[t] = [3, 8, 14, 20, 26]
+流式分块 [2, 3]：
+step([1,2])     -&gt; [3, 8]          state 变成 [1, 2]
+step([3,4,5])   -&gt; [14, 20, 26]    state 变成 [4, 5]
+</code></pre>
+<p><strong>例 2：带 dilation</strong>，K=2，d=3，weight=[1,1]：<code>y[t] = x[t-3] + x[t]</code>，x = [1..6]，离线 y = [1, 2, 3, 5, 7, 9]。</p>
+<pre><code>分块 [1, 4, 1]：
+step([1])          -&gt; [1]           state = [0, 0, 1]
+step([2, 3, 4, 5]) -&gt; [2, 3, 5, 7]  state = [3, 4, 5]
+step([6])          -&gt; [9]           state = [4, 5, 6]
+</code></pre>
+<p>第一块只有 1 个样本、比 state 短：state 要从“旧 state + 新块”拼起来的末尾取，所以仍含两个补出来的 0。</p>
+<p><strong>例 3</strong>：见上方逐步图（K=4, s=2）。分块 [2, 1] 也一样：step(帧0..1) → [13.5, 24.5]，step(帧2) → [130.5, 240.5]，flush → []。</p>
+<p><strong>例 4：K == s</strong>（K=3, s=3, weight=[1,2,3]）：x = [1, 10]，离线 = [1,2,3,10,20,30]；step(帧0) → [1,2,3]，step(帧1) → [10,20,30]，flush → []。检查“裁剪量为 0”的边界。</p>
+<h4>关键问题</h4>
+<ol>
+<li>因果 Conv1d 的 state 要保存多少样本？K=1 时是多少？此时 <code>buf[..., -n:]</code> 在 n=0 时返回什么？</li>
+<li>第一次 step 之前 state 是什么？它的 batch / channel 维从哪来？</li>
+<li>转置卷积收到 n 帧后，哪个位置之前的输出不会再被修改？为什么？</li>
+<li>每次 step 都裁掉本次输出的前 K-s 个会错在哪？用例 3 的 [2,1] 分块想一想。</li>
+<li>bias 应该在什么时刻加？在每块卷积里传 bias 哪些位置会错、错多少？</li>
+<li>flush 时总输出长度是多少？右裁剪后还剩多少？</li>
+<li>from_hf 里 dilation 和 stride 从 HF 模块的哪个属性取？<code>nn.ConvTranspose1d.stride</code> 是 int 还是 tuple？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li><code>nn.Conv1d.weight</code> 是 <code>[C_out, C_in, K]</code>；<code>nn.ConvTranspose1d</code> 的是 <code>[C_in, C_out, K]</code>。都可以直接交给 <code>F.conv1d</code> / <code>F.conv_transpose1d</code>。无 padding 的 conv1d 输出长度 = 输入 − (K-1)·d。</li>
+<li>“已确定”：帧 i 影响 [i·s, i·s+K)；已收到 n 帧时，未来帧只写 ≥ n·s，所以 &lt; n·s 都确定。</li>
+<li>左裁剪针对整条流的前 K-s 个样本（全局 0..K-s-1），需要记录“已输出到哪个全局位置”。</li>
+<li>from_hf：<code>Qwen3OmniMoeCausalConvNet</code> 有 <code>m.conv</code>、<code>m.dilation</code>、<code>m.stride</code>（只支持 1）；<code>Qwen3OmniMoeCausalTransConvNet</code> 的 stride 从 <code>m.conv.stride[0]</code> 取。权重 <code>.detach()</code>，bias 可能为 None。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>StreamingCausalConv1d 状态</strong>：weight、bias、dilation、<code>context = (K-1)·d</code>、state（初始 None，首次 step 按输入 B、C 建全零）。step = 拼接 → 更新 state → 无 padding 的 <code>F.conv1d</code>。</li>
+<li><strong>state 更新顺序</strong>：先 <code>buf = cat([state, x], -1)</code>，再从 <strong>buf</strong> 末尾取 context 个作新 state，最后对 buf 卷积。</li>
+<li><strong>K=1</strong>：用 <code>buf[..., buf.shape[-1]-context:]</code> 或显式判断 <code>context == 0</code>。</li>
+<li><strong>TransConv 状态</strong>：frames（已收帧数）、base（下一个要输出的全局位置）、acc（从 base 开始的未确定样本累加缓冲区）、<code>trim = K - s</code>。</li>
+<li><strong>step</strong>：(1) 本块不带 bias 的 <code>F.conv_transpose1d(x, w, None, stride=s)</code>，覆盖 [frames·s, frames·s + len)；(2) 必要时右侧补零延长 acc，把结果加到对应区间（下标减 base）；(3) frames += t；(4) 输出 [base, frames·s)。</li>
+<li><strong>输出函数（step / flush 共用）</strong>：从 acc 切出前 (upto − base) 个，acc 保留剩余；加 bias；<code>skip = max(0, trim − 旧 base)</code> 去掉落在 [0, trim) 的部分；base = upto。</li>
+<li><strong>分块不变性</strong>：块内重叠由单个 conv_transpose1d 完成，块间重叠由 acc 负责；线性 + 无 bias 时两者组合与离线一致。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案与自检<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li>保存 (K-1)·d 个；K=1 时为 0，<code>buf[..., -0:]</code> 返回整个 buf——必须特判。</li>
+<li>全零 <code>[B, C_in, context]</code>，第一次 step 时用 <code>x.new_zeros(x.shape[0], x.shape[1], context)</code> 懒创建（同时继承 dtype/device）。</li>
+<li>位置 &lt; n·s：未来帧 i ≥ n 只写 [i·s, i·s+K)，起点 ≥ n·s。</li>
+<li>例 3 [2,1] 分块时，第二块 [130.5, 240.5] 会被错裁成 []。左裁剪只作用于全局 0..K-s-1。</li>
+<li>在“输出某个已确定位置”时加一次；每块卷积里加会让块间重叠位置多加。</li>
+<li>总长 (L-1)·s + K，去掉左右各 K-s 后剩 L·s − (K-s)。例 3：8 − 4 = 4。</li>
+<li>Conv：<code>m.dilation</code>、<code>m.stride</code>；TransConv：<code>m.conv.stride[0]</code>（tuple）。</li>
+</ol>
+</div></details>
+<p><strong>自检清单</strong>：</p>
+<ul>
+<li>因果卷积：例 1、例 2 的手工权重按 [5]、[1,1,1,1,1]、[2,3] 分块，结果都是同一个序列；每块输出个数 == 输入个数。</li>
+<li>转置卷积：K=8, s=4 逐帧喂入，累计输出数应为 0, 4, 8, 12, …（= max(0, 4n−4)）。</li>
+<li>K==s：无裁剪，每帧输出 s 个，flush 为空。</li>
+<li>所有 step 与 flush 输出 cat 起来，与 HF 模块离线 forward 用 <code>torch.testing.assert_close</code> 比较。</li>
+</ul>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>有状态流式 vs 无状态“左上下文重算”：对 batching、abort、CUDA graph 各有什么影响？</li>
+<li>Code2Wav 里的滑窗 attention 如何做成流式？</li>
+</ul>
+<p>对照源码：<code>model_executor/models/qwen3_omni/qwen3_omni_code2wav.py:124-218</code> · <code>:447-508</code> · HF <code>Qwen3OmniMoeCausalConvNet</code> · HF <code>Qwen3OmniMoeCausalTransConvNet</code></p>
+<nav class="pager"><a class="prev" href="m05_overview.html"><small>← 上一题</small>#5 · M05 Talker MTP：一帧内预测 15 个残差 codebook</a><a class="next" href="m07_overview.html"><small>下一题 →</small>#7 · M07 按 stage 加载与打包权重</a></nav>
+</main>
+</body>
+</html>

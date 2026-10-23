@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M02 提示 · Thinker Attention：QK-norm + GQA + KV cache</title>
+<meta name="description" content="Qwen3 的 attention 比 Llama 多一步：对每个 head 的 q、k 先 RMSNorm 再 RoPE；同一份实现要同时支持整段 prefill、分块 prefill 和逐 token decode，且三者逐行一致。">
+<link rel="stylesheet" href="assets/hints.css">
+<script src="assets/hints.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="home" href="index.html">nano-vllm-omni · 提示</a>
+  <span class="spacer"></span>
+  <span class="nav"><a href="m01_overview.html">← <span class="lbl">M01</span></a><a href="m03_overview.html"><span class="lbl">M03</span> →</a></span>
+  <button type="button" class="btn" id="theme-btn" title="切换明暗">◐</button>
+</header>
+<main class="page">
+<section class="hero">
+<div class="kicker">#2 · Track M · Qwen-Omni 模型实现 · 书 p.23</div>
+<h1>M02 · Thinker Attention：QK-norm + GQA + KV cache</h1>
+<p class="lede">Qwen3 的 attention 比 Llama 多一步：对每个 head 的 q、k 先 RMSNorm 再 RoPE；同一份实现要同时支持整段 prefill、分块 prefill 和逐 token decode，且三者逐行一致。</p>
+<div class="badges">
+<span class="badge">⏱ <b>60 min</b></span>
+<span class="badge diff-中">难度 <b>中</b></span>
+<span class="badge">实现 <code>mine/m02_thinker_attention.py</code></span>
+<span class="badge">验收 <code>./check.sh m02</code></span>
+<span class="badge">提示 <b>A-2</b> · 参考解 <b>C-2</b> <code>solutions/m02_thinker_attention.py</code></span>
+
+<label class="badge done-toggle"><input type="checkbox" id="done-box" data-id="M02">标记完成</label>
+</div>
+</section><nav class="toc"><b>本页目录</b> · <button type="button" class="btn" id="open-l1">全部展开</button><ol><li><a href="#s1">题面速览</a></li><li><a href="#s2">直觉与类比</a></li><li><a href="#s3">框架视角 · shape trace</a></li><li><a href="#s4">易错点</a></li><li><a href="#s5">逐步图：toy 例子上的 prefill 与 decode</a></li><li><a href="#s6">三级提示</a></li><li><a href="#s7">面试官追问 &amp; 对照源码</a></li></ol></nav><h2 id="s1">题面速览</h2>
+<ul>
+<li><strong>在系统中的位置</strong>：thinker 和 talker 的每一层都有一个这样的 attention。serving 时它几乎从不“整段”运行：长 prompt 被 chunked prefill 切成多块，decode 时每步只有 1 个新 token，历史 K/V 来自 cache（vLLM 里是 paged KV，见 P06/P09；这里用简单的 list 拼接）。</li>
+<li><strong>计算步骤</strong>（单层，新 token 数为 T）：</li>
+</ul>
+<pre><code>q = x @ Wq^T -&gt; [T, H, D]     k = x @ Wk^T -&gt; [T, KVH, D]     v = x @ Wv^T -&gt; [T, KVH, D]
+q = RMSNorm_head(q; q_norm)   k = RMSNorm_head(k; k_norm)     # 对最后一维 D 做，每个 head 独立
+q, k = RoPE(q, k; cos, sin)                                   # cos/sin 只对应这 T 个新 token
+K, V = cat(cache.K, k), cat(cache.V, v)                       # S = past + T
+score[h, t, s] = q[t, h] · K[s, h // (H/KVH)] / sqrt(D)，且 s ≤ past + t（因果）
+out = softmax_fp32(score) @ V -&gt; [T, H*D] @ Wo^T
+</code></pre>
+<ul>
+<li><strong>为什么三种调用方式必须一致</strong>：调度器（P07）决定这一步算多少 token；模型代码只能依赖“<strong>新 token 的绝对位置 = len(cache) + i</strong>”这一条约定。因果 mask 必须按绝对位置算，而不是块内下标。</li>
+<li><strong>GQA</strong>：KV head 少于 Q head（这里 4 vs 2），head h 用 kv head <code>h // (H/KVH)</code>，即 <code>repeat_interleave</code>，<strong>不是</strong> <code>repeat</code>。</li>
+<li><strong>边界</strong>：cache 为 None 就是普通 prefill；T=1 的 decode 和 T&gt;1 的 chunk 用同一份代码。</li>
+</ul>
+<p><strong>验收要点</strong>：整段 prefill 与 HF 一致 · 先 prefill 5 个再逐个 decode 7 次逐行等于整段 · 分块 prefill（4 + 7）等于整段且 cache 长度正确。</p>
+<h2 id="s2">直觉与类比</h2>
+
+<div class="callout analogy"><div class="callout-title">迟到的人读会议纪要</div><p>每个人发言都会记进纪要（KV cache）。迟到的人（新 token）不需要大家重开一遍会，只要读纪要。纪要上记的是当时每句话的时间戳——对应“cache 里的 k 已经用当时的绝对位置旋转过了”，以后永远不用重算。
+新来的人只能看他到场之前（含自己）的发言（因果 mask）。关键是要用<strong>会议总时钟</strong>判断“之前”，而不是“我今天是第 0 个到的”——否则 decode 的 token 以为自己在位置 0，只能看到第一句话。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">GQA：同桌合用一本参考书</div><p>每个 Q head 是一个学生，每个 KV head 是一本参考书（H = 4、KVH = 2）：相邻座位的 H/KVH 个学生合用一本——学生 0、1 用书 0，学生 2、3 用书 1。这就是 <code>h // (H // KVH)</code>，等价于把书 <code>repeat_interleave</code>。误用 <code>repeat</code> 就变成“隔一个座位共用一本”（0、2 用书 0）——而在 H == KVH 的测试里你根本发现不了。</p>
+</div>
+
+<div class="callout analogy"><div class="callout-title">QK-norm：比赛前统一称重</div><p>在 RoPE 之前对每个 head 的 q、k 各自做 RMSNorm（对 head_dim），把每个 head 拉到同一“量级”，点积不会因为某些 head 激活特别大而爆掉。顺序是 <strong>proj → QK-norm → RoPE</strong>：RMS 对旋转不变，但逐维的 q_norm 权重不是，顺序反了数值就不同。v 不做 norm。</p>
+</div>
+<h2 id="s3">框架视角 · shape trace</h2>
+<p>记号：新 token 数 T，past = 调用前的 <code>len(cache)</code>，S = past + T。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>tensor</th>
+<th>shape</th>
+<th>发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>x</code></td>
+<td><code>[T, hidden]</code></td>
+<td>只有新 token</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>q</code> / <code>k, v</code></td>
+<td><code>[T, H, D]</code> / <code>[T, KVH, D]</code></td>
+<td><code>x @ proj.T</code> 后 view；q_proj 的行按 head 分块，最后一维连续 D 个数属于同一个 head</td>
+</tr>
+<tr>
+<td>3</td>
+<td>QK-norm</td>
+<td>同上</td>
+<td>对最后一维 D 做 RMSNorm，所有 head 共享 q_norm（k 用 k_norm）；v 不动</td>
+</tr>
+<tr>
+<td>4</td>
+<td>RoPE</td>
+<td>同上</td>
+<td>cos/sin <code>[T, D]</code> → <code>[T, 1, D]</code> 广播到每个 head</td>
+</tr>
+<tr>
+<td>5</td>
+<td>cache</td>
+<td>K, V: <code>[S, KVH, D]</code></td>
+<td><strong>先读 past</strong>，再追加本次 k、v，再拼接全部块</td>
+</tr>
+<tr>
+<td>6</td>
+<td>GQA</td>
+<td><code>[S, H, D]</code></td>
+<td>每个 KV head 复制给相邻的 H/KVH 个 Q head</td>
+</tr>
+<tr>
+<td>7</td>
+<td>scores</td>
+<td><code>[H, T, S]</code> fp32</td>
+<td><code>q·K · D^-0.5</code>；<code>k_pos &gt; past + t</code> 的位置置 -inf</td>
+</tr>
+<tr>
+<td>8</td>
+<td>probs @ V</td>
+<td><code>[T, H, D]</code></td>
+<td>softmax 在 key 维（fp32），加权求和后转回 x.dtype</td>
+</tr>
+<tr>
+<td>9</td>
+<td>输出</td>
+<td><code>[T, H·D] @ o_proj.T → [T, hidden]</code></td>
+<td>reshape 与第 2 步的 view 对称</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="s4">易错点</h2>
+<ul>
+<li>在追加之后才读 <code>len(cache)</code>：past 多算了 T，mask 整体右移，token 能“偷看”同一块后面的 token。</li>
+<li>mask 用块内下标 <code>arange(T)</code> 而不是 <code>past + arange(T)</code>：decode 的 token 只能看见 key 0。</li>
+<li>GQA 用 <code>repeat</code> / <code>expand</code> + 错误 reshape 得到 0,1,0,1 映射；H == KVH 时看不出来。</li>
+<li>QK-norm 放在 RoPE 之后，或对整个 H·D 做 norm 而不是对每个 head 的 D。</li>
+<li>softmax 在 <code>dim=-2</code> 上做（每列和为 1），或在 bf16 里做 softmax。</li>
+<li>对 cache 里的旧 k 重新做 RoPE（它们早已用正确的绝对位置旋转过）。</li>
+</ul>
+<h2 id="s5">逐步图：toy 例子上的 prefill 与 decode</h2>
+
+<div class="stepper"><div class="st-head"><span class="st-title">▶ hidden=2, H=KVH=1, D=2, 全单位阵投影, cos=1/sin=0</span><span class="st-count"></span><span class="st-ctrl"><button type="button" class="btn st-prev">← 上一步</button><button type="button" class="btn primary st-next">下一步 →</button></span></div><div class="st-dots"></div><div class="st-body"><div class="step" data-hl=""><div class="step-title">1. 输入与 QK-norm</div><pre><code>x = [[1, 0],
+     [0, 1],
+     [3, 3]]                       # T = 3
+QK-norm 之后: q = k = [[1.414, 0], [0, 1.414], [1, 1]]   # 每行除以自身 RMS
+v 不做 norm:  v = x
+</code></pre>
+<p>scale = D^-0.5 = 1/1.414。</p>
+</div><div class="step" data-hl=""><div class="step-title">2. 一次性 prefill（past = 0）</div><p>mask 是普通下三角：</p>
+<p><span class="cells"><span class="cell ok">✓</span><span class="cell bad">·</span><span class="cell bad">·</span></span> token0 只看见 key0<br />
+<span class="cells"><span class="cell ok">✓</span><span class="cell ok">✓</span><span class="cell bad">·</span></span> token1 看见 key0..1<br />
+<span class="cells"><span class="cell ok">✓</span><span class="cell ok">✓</span><span class="cell ok">✓</span></span> token2 看见全部</p>
+<pre><code>token0 -&gt; [1.0000, 0.0000]          # 只能看见自己
+token1: scores [0, 1.414] -&gt; softmax [0.1956, 0.8044] -&gt; [0.1956, 0.8044]
+token2: scores [1, 1, 1.414] -&gt; softmax [0.2846, 0.2846, 0.4307] -&gt; [1.5768, 1.5768]
+</code></pre>
+</div><div class="step" data-hl=""><div class="step-title">3. 分两次调用：第一次 x[:2]</div><pre><code>cache = KVCache()
+a = attention_forward(w, x[:2], cos[:2], sin[:2], cache)  # -&gt; [[1, 0], [0.1956, 0.8044]]
+len(cache) == 2; cache.k == [tensor of shape [2, 1, 2]]
+</code></pre>
+<p>past = 0（<strong>在 append 之前</strong>读的）。</p>
+</div><div class="step" data-hl=""><div class="step-title">4. 第二次 x[2:]（decode，past = 2）</div><pre><code>b = attention_forward(w, x[2:], cos[2:], sin[2:], cache)  # -&gt; [[1.5768, 1.5768]]
+len(cache) == 3; cache.k 里有两个块: [2,1,2] 和 [1,1,2]
+</code></pre>
+<p>q_pos = past + 0 = 2，k_pos = [0, 1, 2] 全部可见：<span class="cells"><span class="cell ok">✓</span><span class="cell ok">✓</span><span class="cell ok">✓</span></span></p>
+<p>cos/sin 只有 1 行——它属于绝对位置 2 的那个新 token。<code>cat([a, b])</code> 与一次性 prefill 逐行相同。</p>
+</div><div class="step" data-hl=""><div class="step-title">5. 两种错误的样子</div><div class="table-wrap"><table>
+<thead>
+<tr>
+<th>错误</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>完全没有 causal mask</td>
+<td><code>[[1.5665, 1.1690], [1.1690, 1.5665], [1.5768, 1.5768]]</code>——只有最后一行碰巧正确</td>
+</tr>
+<tr>
+<td>decode 时 mask 用块内下标（q_pos = 0 而不是 2）</td>
+<td>第三个 token 只能看见 key 0：<span class="cells"><span class="cell ok">✓</span><span class="cell bad">✗</span><span class="cell bad">✗</span></span> 输出 <code>[1, 0]</code> 而不是 <code>[1.5768, 1.5768]</code></td>
+</tr>
+</tbody>
+</table></div>
+</div><div class="step" data-hl=""><div class="step-title">6. GQA 映射（H=8, KVH=2）</div><p>q head h：<span class="cells"><span class="cell ">0</span><span class="cell ">1</span><span class="cell ">2</span><span class="cell ">3</span><span class="cell ">4</span><span class="cell ">5</span><span class="cell ">6</span><span class="cell ">7</span></span></p>
+<p>正确 <code>h // 4</code>（repeat_interleave）：<span class="cells"><span class="cell t">0</span><span class="cell t">0</span><span class="cell t">0</span><span class="cell t">0</span><span class="cell h">1</span><span class="cell h">1</span><span class="cell h">1</span><span class="cell h">1</span></span></p>
+<p>错误 <code>h % 2</code>（repeat）：<span class="cells"><span class="cell t">0</span><span class="cell h">1</span><span class="cell t">0</span><span class="cell h">1</span><span class="cell t">0</span><span class="cell h">1</span><span class="cell t">0</span><span class="cell h">1</span></span></p>
+</div></div></div>
+<h2 id="s6">三级提示</h2>
+
+<details class="hint l1"><summary><span class="lvl">L1</span>I/O 示例与关键问题<span class="spoiler-note">I/O 示例 + 关键问题 + 细节（轻度剧透）</span></summary><div class="body"><p>见上面的逐步图：toy（hidden=2，H=KVH=1，D=2，全单位阵，q_norm=k_norm=[1,1]，eps=0，cos 全 1、sin 全 0）上整段 prefill 得 <code>[[1,0],[0.1956,0.8044],[1.5768,1.5768]]</code>，分两次（2 + 1）调用得到相同结果。</p>
+<h4>关键问题</h4>
+<ol>
+<li>q_proj 的形状是 <code>[H·D, hidden]</code>。<code>x @ q_proj.T</code> 得到 <code>[T, H·D]</code> 后，怎样 view 成 <code>[T, H, D]</code> 才能保证“第 h 个 head”是连续的 D 列？</li>
+<li>QK-norm 对哪一维做？q_norm 形状 <code>[D]</code> 怎样广播到 <code>[T, H, D]</code>？v 要不要 norm？</li>
+<li>cos/sin 只有 T 行，K 有 S = past + T 行。cache 里的旧 K 需要重新做 RoPE 吗？</li>
+<li>第 i 个新 token（块内下标 i）的绝对位置是多少？它能看见哪些 key？</li>
+<li><code>[S, KVH, D]</code> → <code>[S, H, D]</code> 用 <code>repeat</code> 还是 <code>repeat_interleave</code>？H=4, KVH=2 时各给出什么映射？</li>
+<li>“softmax in fp32”指哪几步在 fp32 里做？最后在哪里转回 x.dtype？</li>
+<li>先把新 k/v 追加进 cache 再 attention，还是先 attention 再追加？哪个能让 token 看见它自己？</li>
+</ol>
+<h4>细节</h4>
+<ul>
+<li>“RMSNorm EACH HEAD … over head_dim”：把 q 看成 <code>[T, H, D]</code>，对最后一维 D 独立算 RMS；所有 head 共享 q_norm <code>[D]</code>。eps 取 <code>w.eps</code>。</li>
+<li>“rows belong to the NEW tokens”：调用方已按绝对位置算好 cos/sin 并只切出新 token 的行；函数内部不需要、也不应该自己算位置。cache 中保存的是 RoPE 过的 k（以及原样的 v）。</li>
+<li>KVCache：k、v 是块的 list，每块 <code>[t, KVH, D]</code>；<code>len(cache)</code> 是所有块 t 之和——所以 past 必须在 append 之前读。</li>
+<li>causal 按绝对位置：p = past + i，可见 key 0..p。整段 prefill 时退化为普通下三角；decode（T=1）时能看见全部 S 个 key。</li>
+<li>输出：<code>[T, H, D]</code> 先 reshape 成 <code>[T, H·D]</code> 再 <code>@ o_proj.T</code>。</li>
+</ul>
+</div></details>
+
+<details class="hint l2"><summary><span class="lvl">L2</span>思路与常见坑<span class="spoiler-note">思路拆分与常见坑（中度剧透）</span></summary><div class="body"><ul>
+<li><strong>步骤拆分</strong>：(1) 三个投影 + view；(2) per-head RMSNorm helper（复用 M01：fp32 归一化 → 转回 → 乘 weight）；(3) rotate_half + RoPE helper（cos/sin 在 head 维广播）；(4) cache 处理得到 past 和全量 K/V；(5) GQA 展开；(6) scores + mask + softmax + 加权求和；(7) reshape + o_proj。</li>
+<li><strong>cache 顺序</strong>：先读 <code>past = len(cache)</code>，再 append，再 <code>torch.cat</code> 全部块。先 append 再读 len → past 多算 T，mask 整体偏移。cache 为 None 时 past = 0。</li>
+<li><strong>GQA</strong>：<code>k.repeat_interleave(H // KVH, dim=1)</code> → 0,0,1,1 映射。</li>
+<li><strong>scores</strong>：<code>einsum(&quot;thd,shd-&gt;hts&quot;)</code> 再乘 <code>D ** -0.5</code>，在 fp32 里做（q、K 先 <code>.float()</code>）。</li>
+<li><strong>mask</strong>：<code>q_pos = arange(past, past+T)[:, None]</code>，<code>k_pos = arange(S)[None, :]</code>，<code>k_pos &gt; q_pos</code> 处填 -inf，<code>[T, S]</code> 自动广播到 <code>[H, T, S]</code>。每个 query 至少能看见 key 0，不会整行 -inf。</li>
+<li><strong>softmax 与加权</strong>：<code>softmax(scores, dim=-1)</code>，再 <code>einsum(&quot;hts,shd-&gt;thd&quot;)</code>，然后 <code>.to(x.dtype)</code>。softmax 在 dim=-2 上做时 toy 的 token0 不再是 v0。</li>
+<li><strong>自测</strong>：随机 T=6 输入，(a) 一次调用；(b) 3+3 两次；(c) 6 次 T=1，三者 cat 后 allclose。</li>
+</ul>
+</div></details>
+
+<details class="hint l3"><summary><span class="lvl">L3</span>详解：答案与形状追踪<span class="spoiler-note">详解：答案、逐步追踪、骨架提示（重度剧透）</span></summary><div class="body"><details class="answer"><summary>关键问题答案</summary><div class="body"><ol>
+<li><code>(x @ q_proj.T).view(T, H, D)</code>：q_proj 的行按 head 分块（前 D 行是 head 0），view 后最后一维连续 D 个数属于同一个 head。</li>
+<li>对最后一维 D；<code>[D]</code> 自动广播到 <code>[T, H, D]</code>；v 不 norm。</li>
+<li>不需要：cache 里存的就是当时已用正确绝对位置旋转过的 k，位置不会变。</li>
+<li>绝对位置 = past + i；可见 key 下标 0..past+i（含）。</li>
+<li><code>repeat_interleave</code>：H=4, KVH=2 → [0,0,1,1]（正确）；<code>repeat</code> → [0,1,0,1]（错误）。</li>
+<li>q·k、缩放、mask、softmax、与 V 的乘法都在 fp32；乘完 V 后转回 x.dtype，再做 o_proj。</li>
+<li>先追加再 attention：新 token 的 key 也在 K 里，mask 允许 s == p，token 能看见自己。</li>
+</ol>
+</div></details>
+<p><strong>形状追踪</strong>（H=4, KVH=2, D=8, hidden=32, 已缓存 past=5，新 T=2）：</p>
+<pre><code>x             [2, 32]
+q             [2, 4, 8]      k, v [2, 2, 8]
+QK-norm       same shapes
+RoPE          q, k with cos/sin [2, 8] -&gt; [2, 1, 8] broadcast
+cache cat     K, V [7, 2, 8]             (S = 5 + 2)
+GQA           K, V [7, 4, 8]
+scores        [4, 2, 7]       mask [2, 7]: row0 sees s ≤ 5, row1 sees s ≤ 6
+probs @ V     [2, 4, 8] -&gt; reshape [2, 32] -&gt; @ o_proj.T -&gt; [2, 32]
+</code></pre>
+<p><strong>逐行核对 toy 的 token2</strong>（past=2，T=1）：q = [1,1]，K = [[1.414,0],[0,1.414],[1,1]]，scores = [1.414, 1.414, 2]/1.414 = [1, 1, 1.414]；q_pos = 2 全部可见；softmax = [0.2846, 0.2846, 0.4307]；输出 = 0.2846·[1,0] + 0.2846·[0,1] + 0.4307·[3,3] = [1.5768, 1.5768]。得到 <code>[1, 0]</code> 说明 q_pos 用了 0；第一行不是 <code>[1, 0]</code> 说明 mask 缺失或 softmax 维度错了。</p>
+<p><strong>与 serving 的联系</strong>：“past = len(cache)，新 token 绝对位置 = past + i”正是 vLLM 里 <code>seq_lens</code> / <code>query_start_loc</code> 携带的信息；paged attention 只是把 <code>torch.cat(cache.k)</code> 换成按 block table 读取，mask 逻辑不变。</p>
+</div></details>
+<h2 id="s7">面试官追问 &amp; 对照源码</h2>
+<ul>
+<li>把 list 拼接换成 P06 的 paged KV + P09 的 paged attention，接口要怎么变？</li>
+<li>QK-norm 和 RoPE 能不能融合成一个 kernel？vllm-omni 为什么曾经因为编译融合出问题？</li>
+</ul>
+<p>对照源码：<code>model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py:588-596</code> · HF <code>Qwen3OmniMoeThinkerTextAttention.forward</code></p>
+<nav class="pager"><a class="prev" href="m01_overview.html"><small>← 上一题</small>#1 · M01 RMSNorm 与多模态 RoPE（interleaved / chunked）</a><a class="next" href="m03_overview.html"><small>下一题 →</small>#3 · M03 Sparse MoE：路由、按 expert 分组计算、shared expert</a></nav>
+</main>
+</body>
+</html>
