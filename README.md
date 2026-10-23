@@ -84,3 +84,9 @@ cd ~/development/nano-vllm-omni-drills
 - `.venv` 是用 `--system-site-packages` 建的，torch 直接用 base 环境里的；base 环境里的 transformers 5.x 不受影响。
 - 系统 `PYTHONPATH` 里有 ROS 的 pytest 插件，会导致 pytest 启动失败，`pytest.ini` 里已经用 `-p no:...` 关掉了。
 - 想重做某一题：从 PDF 重新抄骨架，或者用 `git checkout mine/<文件>` 还原。
+
+## License
+
+Code is released under the [MIT License](LICENSE); the book PDFs in `book/` are released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See [LICENSE](LICENSE).
+
+代码采用 MIT 许可证；`book/` 下的 PDF 采用 CC BY 4.0，转载或改编请注明出处并附上本仓库链接。
