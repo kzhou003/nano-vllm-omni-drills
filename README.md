@@ -4,6 +4,7 @@ Hands-on drills for **Part I of the nano-vllm-omni self-study book**: 26 one-hou
 
 - `mine/` holds skeletons for you to fill in, `tests/` holds the acceptance tests, and `solutions/` holds reference solutions.
 - Everything runs on CPU; no GPU required.
+- Read online: <https://kzhou003.github.io/nano-vllm-omni-drills/>
 - The book (problem statements, background, follow-up interview questions) is in [`book/`](book/): [English](book/nano-vllm-omni-book-en.pdf) · [中文](book/nano-vllm-omni-book-cn.pdf).
 
 Quick start: `./check.sh m01` runs the tests for drill M01 against your code in `mine/`. The rest of this README is in Chinese.
