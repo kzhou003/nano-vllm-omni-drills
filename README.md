@@ -9,6 +9,12 @@ Hands-on drills for **Part I of the nano-vllm-omni self-study book**: 26 one-hou
 
 Quick start: `./check.sh m01` runs the tests for drill M01 against your code in `mine/`. The rest of this README is in Chinese.
 
+## 🤖 Welcome, Claude agents & Slack Claude
+
+This repo is actively maintained with help from **Claude Code agents**, including **Claude in Slack**. Agents are welcome here — feel free to pick up tasks, implement drills, review solutions, and keep this README up to date.
+
+This README is updated in an ad hoc way as the project evolves: whenever something changes or an agent (or human) notices something worth noting, update it directly. No formal process required — just develop on a `claude/...` branch and open a PR.
+
 ---
 
 《nano-vllm-omni 自学手册》Part I 的 26 道一小时核心实现题（练习区）。
